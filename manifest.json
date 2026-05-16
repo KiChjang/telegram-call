@@ -1,6 +1,6 @@
 {
   "name": "telegram-call",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "author": "Keith Yeung",
   "description": "Synthesizes spoken audio from text via a local Kokoro-FastAPI server and places a 1-on-1 Telegram voice call that plays it. Self-installs and self-authenticates on first use; auth has a dedicated verification tool so a wrong code can be retried without invalidating it.",
   "timeout_secs": 600,
@@ -30,7 +30,7 @@
     },
     {
       "name": "verify_telegram_code",
-      "description": "Submit a Telegram verification code (or 2FA cloud password) during the one-time login flow. ONLY use this AFTER `make_call` returned a message asking for a code or password — never as the first step. The tool figures out from internal state whether to verify a `code` or a `password`; pass whichever one the user supplied. NOTE on where the code comes from: when Telegram issues a login code it is delivered as an in-app message from the official 'Telegram' service account to the user's existing logged-in Telegram sessions (their phone app, Telegram Desktop, etc.); SMS is a slow fallback that may take a minute or more, or fail silently on some carriers. If the user says they 'didn't get a code', tell them to check the 'Telegram' chat in their app first. If Telegram rejects the value as invalid (a typo), the auth state is preserved so you can retry by calling this tool again with a corrected value — do NOT call `make_call` with `phone` again, that would invalidate the code that was already sent. After this tool succeeds you can call `make_call` to place the actual call.",
+      "description": "Submit a Telegram verification code (or 2FA cloud password) during the one-time login flow, OR ask Telegram to redeliver the current code via the next channel. ONLY use this AFTER `make_call` returned a message asking for a code/password — never as the first step. Where the code comes from: by default Telegram delivers the login code as an in-app message from the official 'Telegram' service-account chat to the user's existing logged-in sessions (phone app, Telegram Desktop, etc.); SMS / voice-call delivery only happens after `resend`. The tool's success message tells you which channel was used. Behaviour: (a) call with `code` to verify a code; (b) call with `password` to submit a 2FA cloud password; (c) call with `resend: true` if the user genuinely did not receive any code — Telegram will redeliver via the next available channel (typically APP → SMS → CALL). If Telegram rejects a code as invalid (typo) the auth state is preserved so you can retry with a corrected value; do NOT call `make_call` with `phone` again, that would force a new send_code and invalidate the current code. After successful verification you can call `make_call` to place the actual call.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -41,6 +41,10 @@
           "password": {
             "type": "string",
             "description": "The user's Telegram 2FA cloud password. Provide this when verification returned a '2FA enabled' message asking for `password`."
+          },
+          "resend": {
+            "type": "boolean",
+            "description": "Set to true to ask Telegram to redeliver the verification code via the next channel (in-app → SMS → voice call). Use this ONLY if the user is sure they did not receive a code at all — not if they entered a wrong code (in that case just retry with the correct `code`). Do not combine with `code`/`password`."
           }
         }
       }

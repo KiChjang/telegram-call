@@ -1,7 +1,7 @@
 ---
 name: telegram-call
 description: Synthesize a spoken message and place an outgoing 1-on-1 Telegram voice call that plays it. Self-installs and self-authenticates on first use. Triggers: call me, phone call, voice call, urgent notification, call X about Y, tell X.
-version: 0.4.0
+version: 0.4.1
 author: Keith Yeung
 always: false
 requires_bins: python3,ffmpeg
@@ -58,11 +58,38 @@ whether to verify a `code` or a `password`.
 
 - `code` (provide when verification was requested): typically 5 digits.
 - `password` (provide when 2FA was requested): the user's cloud password.
+- `resend` (boolean, optional): set to `true` to ask Telegram to redeliver
+  the current code via the next channel — see *Code didn't arrive?* below.
 
 If Telegram rejects the value as invalid (typo), the auth state is preserved
 so you can retry just the code/password — do **not** restart the auth flow
 or call `make_call` with `phone` again, that would invalidate the code that
 was already sent.
+
+#### Code didn't arrive?
+
+By default Telegram sends the login code as an in-app message from the
+official "Telegram" service-account chat to your other logged-in Telegram
+sessions (phone app, Telegram Desktop, etc.). It does **not** SMS you
+unless you don't have any other session reachable, and even then there can
+be carrier delays. The skill's success message tells you which channel
+Telegram chose (`an in-app Telegram message` / `SMS` / `an automated voice
+call` / …) and which channel a resend would escalate to.
+
+If the user truly received nothing:
+
+```
+verify_telegram_code({resend: true})
+```
+
+This calls `auth.resendCode` under the hood, cycling delivery typically
+through `APP → SMS → CALL`. The previous code is invalidated; only accept
+the freshly-arriving one.
+
+If you instead see a flood-wait message (Telegram is rate-limiting code
+requests for that number), wait the indicated duration before retrying —
+sending another code immediately won't deliver and will only push the
+flood-wait window further out.
 
 ### make_call
 

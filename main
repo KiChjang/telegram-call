@@ -193,6 +193,87 @@ async def _auth_client():
     return app, pg
 
 
+_SENT_CODE_LABELS = {
+    "APP": "an in-app Telegram message (from the official 'Telegram' "
+           "service-account chat to the user's existing logged-in sessions)",
+    "SMS": "SMS",
+    "CALL": "an automated voice call (a Telegram robot will phone the user "
+            "and read the 5-digit code aloud)",
+    "FLASH_CALL": "a flash call (the code is the last digits of the "
+                  "incoming caller ID)",
+    "MISSED_CALL": "a missed call (the code is the last digits of the "
+                   "missed-call number)",
+    "EMAIL_CODE": "email",
+    "FRAGMENT_SMS": "Fragment SMS (anonymous number)",
+    "FIREBASE_SMS": "SMS (via Firebase)",
+}
+
+
+def _sent_code_label(t) -> str:
+    """Human-readable description of a Pyrogram `SentCodeType` value."""
+    if t is None:
+        return "an unspecified channel"
+    name = getattr(t, "name", str(t)).upper()
+    return _SENT_CODE_LABELS.get(name, name.lower().replace("_", " "))
+
+
+def _flood_wait_seconds(exc) -> int:
+    """Pull the wait-seconds out of a pyrogram FloodWait, tolerating both
+    the 2.x `.value` attribute and the older `.x` attribute."""
+    for attr in ("value", "x"):
+        v = getattr(exc, attr, None)
+        if isinstance(v, int) and v >= 0:
+            return v
+    try:
+        return int(str(exc).split()[-1])
+    except Exception:
+        return 0
+
+
+def _humanize_seconds(s: int) -> str:
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    h, rem = divmod(s, 3600)
+    return f"{h}h {rem // 60}m"
+
+
+def _build_code_sent_message(phone: str, sent, action: str = "issued") -> str:
+    """Format the message returned to the agent after a successful
+    send_code / resend_code, telling it where Telegram routed the code."""
+    sent_label = _sent_code_label(getattr(sent, "type", None))
+    next_label = _sent_code_label(getattr(sent, "next_type", None)) \
+        if getattr(sent, "next_type", None) is not None else None
+    timeout = getattr(sent, "timeout", None) or 0
+
+    msg = (
+        f"Telegram has {action} a verification code for {phone} (the user's "
+        f"OWN Telegram account, NOT the recipient). It says the code was "
+        f"delivered via {sent_label}. "
+    )
+    msg += (
+        "Tell the user where to look (in-app chat, SMS, or incoming call as "
+        "appropriate), then pass the 5-digit code to the "
+        "`verify_telegram_code` tool as the `code` parameter. "
+    )
+    if next_label:
+        wait_hint = (
+            f" (Telegram allows another resend in ~{timeout}s.)"
+            if timeout else ""
+        )
+        msg += (
+            f"IF the code never arrives, the agent should call "
+            f"`verify_telegram_code` with `resend: true` to escalate "
+            f"delivery to {next_label}.{wait_hint} "
+        )
+    msg += (
+        "Do NOT call `make_call` again with `phone` — that would invalidate "
+        "the code that was just issued."
+    )
+    return msg
+
+
 async def send_phone_code(phone: str) -> None:
     """Step 1 of auth: ask Telegram to send a verification code to the user's
     phone, persist the resulting `phone_code_hash`, and exit with a message
@@ -211,26 +292,107 @@ async def send_phone_code(phone: str) -> None:
                 "the user to double-check and provide a fresh `phone` "
                 "(must include the country code, e.g. +44…)."
             )
+        except errors.PhoneNumberBanned:
+            fail(
+                f"Telegram has banned the phone number {phone}. The user "
+                "must contact Telegram support to lift the ban; this skill "
+                "cannot work around it."
+            )
+        except errors.PhoneNumberFlood:
+            fail(
+                f"Telegram has temporarily blocked new login codes for "
+                f"{phone} because too many have been requested recently. "
+                "Wait at least 24 hours before trying this number again, "
+                "or use a different Telegram account."
+            )
+        except errors.FloodWait as e:
+            wait = _flood_wait_seconds(e)
+            fail(
+                f"Telegram is rate-limiting login-code requests for {phone}. "
+                f"Wait {_humanize_seconds(wait)} ({wait}s) and call "
+                "`make_call` with the same `phone` again. Telegram will "
+                "ignore further `send_code` calls until that window expires "
+                "— so the code the user sees might still arrive from the "
+                "*previous* attempt; if so, use `verify_telegram_code` with "
+                "that code instead of asking for a fresh one."
+            )
         except errors.BadRequest as e:
             fail(f"Telegram rejected the phone number: {e}")
         save_auth_state({
             "awaiting": "code",
             "phone": phone,
             "phone_code_hash": sent.phone_code_hash,
+            "sent_type": getattr(getattr(sent, "type", None), "name", None),
+            "next_type": getattr(getattr(sent, "next_type", None), "name", None),
         })
+        fail(_build_code_sent_message(phone, sent, action="issued"))
+    finally:
+        try:
+            await app.disconnect()
+        except Exception:
+            pass
+
+
+async def resend_phone_code() -> None:
+    """Ask Telegram to redeliver the current verification code via the next
+    channel (typically APP → SMS → CALL). Reuses the persisted
+    `phone_code_hash` and updates state with whatever Telegram returns."""
+    state = load_auth_state()
+    if state.get("awaiting") != "code":
         fail(
-            f"Telegram has issued a verification code for {phone} (the "
-            "account that will place the call). Important: Telegram delivers "
-            "this code as an *in-app message* from the official 'Telegram' "
-            "service account to the user's existing logged-in Telegram "
-            "sessions FIRST (phone app, Telegram Desktop, etc.); it only "
-            "falls back to SMS after a minute or two, and SMS may not arrive "
-            "at all on some carriers. Tell the user to check the 'Telegram' "
-            "chat in their app for a 5-digit code, then pass that code to "
-            "the `verify_telegram_code` tool as the `code` parameter. Do "
-            "NOT call `make_call` again with `phone` — that would invalidate "
-            "the code that was just sent."
+            "No verification code is currently being awaited, so there is "
+            "nothing to resend. Start the auth flow by calling `make_call` "
+            "with the user's `phone` first."
         )
+    phone = state.get("phone")
+    phone_code_hash = state.get("phone_code_hash")
+    if not phone or not phone_code_hash:
+        clear_auth_state()
+        fail(
+            "Lost track of the in-flight verification code. Call `make_call` "
+            "with the user's `phone` to start the auth flow again."
+        )
+
+    app, pg = await _auth_client()
+    errors = pg["errors"]
+    try:
+        try:
+            sent = await app.resend_code(phone, phone_code_hash)
+        except errors.PhoneCodeExpired:
+            clear_auth_state()
+            fail(
+                "The previous verification code has already expired, so "
+                "Telegram won't resend it. Call `make_call` with the user's "
+                "`phone` to restart the auth flow with a fresh code."
+            )
+        except errors.FloodWait as e:
+            wait = _flood_wait_seconds(e)
+            fail(
+                f"Telegram is rate-limiting resend requests for {phone}. "
+                f"Wait {_humanize_seconds(wait)} ({wait}s) before calling "
+                "`verify_telegram_code` with `resend: true` again."
+            )
+        except errors.RPCError as e:
+            fail(
+                f"Telegram rejected the resend request: {type(e).__name__}: "
+                f"{e}. The auth state has been preserved; the user can "
+                "still submit any code they may have already received via "
+                "`verify_telegram_code` with `code`."
+            )
+
+        save_auth_state({
+            "awaiting": "code",
+            "phone": phone,
+            "phone_code_hash": sent.phone_code_hash,
+            "sent_type": getattr(getattr(sent, "type", None), "name", None),
+            "next_type": getattr(getattr(sent, "next_type", None), "name", None),
+        })
+        msg = _build_code_sent_message(phone, sent, action="resent")
+        msg += (
+            " Note: any previously-issued code for this login is now "
+            "invalid — only accept the freshly-arriving one."
+        )
+        fail(msg)
     finally:
         try:
             await app.disconnect()
@@ -527,12 +689,25 @@ async def amain_make_call(input_data: dict) -> None:
 
     if not auth_complete():
         if awaiting == "code":
-            fail(
-                f"Telegram is awaiting the verification code that was sent "
-                f"to {state['phone']}. Ask the user for the code and call "
-                "the `verify_telegram_code` tool with it as `code`. Do NOT "
-                "call `make_call` again until verification succeeds."
+            sent_label = _SENT_CODE_LABELS.get(
+                state.get("sent_type") or "", "an in-app Telegram message"
             )
+            next_label = _SENT_CODE_LABELS.get(state.get("next_type") or "", None)
+            msg = (
+                f"Telegram is awaiting the verification code that was sent "
+                f"to {state['phone']} via {sent_label}. Ask the user for the "
+                "code and call the `verify_telegram_code` tool with it as "
+                "`code`. Do NOT call `make_call` again until verification "
+                "succeeds — calling it with `phone` would invalidate the "
+                "code."
+            )
+            if next_label:
+                msg += (
+                    f" If the user says they never received a code, call "
+                    f"`verify_telegram_code` with `resend: true` to make "
+                    f"Telegram redeliver via {next_label}."
+                )
+            fail(msg)
         if awaiting == "password":
             fail(
                 "Telegram is awaiting the user's 2FA cloud password. Ask "
@@ -596,17 +771,36 @@ async def amain_verify(input_data: dict) -> None:
             or input_data.get("verification_code")
             or "").strip()
     password = (input_data.get("password") or "").strip()
+    resend = bool(input_data.get("resend"))
+
+    if resend:
+        if awaiting != "code":
+            fail(
+                "Nothing to resend: no verification code is currently in "
+                "flight. Start the auth flow with `make_call` and `phone`."
+            )
+        await resend_phone_code()
+        return
 
     if awaiting == "code":
         if not code:
-            fail(
+            sent_label = _SENT_CODE_LABELS.get(
+                state.get("sent_type") or "", "an in-app Telegram message"
+            )
+            next_label = _SENT_CODE_LABELS.get(state.get("next_type") or "", None)
+            msg = (
                 f"A verification code was sent for the Telegram account "
                 f"{state.get('phone')!r} (the account that will place the "
-                "call). Tell the user to look for an in-app message from "
-                "the 'Telegram' service account in their existing logged-in "
-                "Telegram session(s); SMS is a delayed fallback. Pass the "
-                "5-digit code to this tool as the `code` parameter."
+                f"call) via {sent_label}. Tell the user where to look and "
+                "pass the 5-digit code to this tool as the `code` parameter."
             )
+            if next_label:
+                msg += (
+                    f" If the user genuinely did not receive a code, call "
+                    f"this tool with `resend: true` to ask Telegram to "
+                    f"redeliver via {next_label}."
+                )
+            fail(msg)
         await verify_phone_code(code)
         ok(
             "Telegram sign-in complete. The agent can now call `make_call` "
