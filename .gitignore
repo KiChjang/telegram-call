@@ -1,0 +1,30 @@
+# Self-bootstrapped venv created on first invocation; recreated by the
+# installer in the user's install location, never committed.
+.venv/
+
+# Python bytecode and editor scratch.
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# pyrogram session files. Normally written to $OCTOS_DATA_DIR, but ignore
+# defensively in case the skill is invoked from this directory during dev.
+*.session
+*.session-journal
+
+# Skill runtime state — never source-controlled.
+auth_state.json
+auth_state.json.tmp
+auth_complete
+
+# TTS cache (lives in $OCTOS_WORK_DIR in production; defensive ignore).
+telegram-call-tts/
+*.mp3.tmp
+
+# OS / editor cruft.
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/

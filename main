@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""telegram-call skill: places a 1-on-1 Telegram voice call to a user, plays
+an audio file, and hangs up. Uses the standard stdin/stdout JSON skill
+protocol for the Octos gateway.
+
+This script is fully self-bootstrapping. After `octos skills install`:
+
+1. On first invocation it creates a private venv at .venv/ inside the skill
+   directory, pip-installs pyrogram / pytgcalls / tgcrypto, then re-execs
+   itself using that venv's Python. No external `pip install` step is
+   needed.
+2. Telegram authentication is driven through the chat: when the session is
+   missing, the skill returns `success: false` with a clear message asking
+   the agent to relay a question to the user (phone, then verification
+   code, then optional 2FA password). Each call carries the next piece of
+   information back as a parameter. No interactive shell login is needed.
+
+Once authenticated, normal calls only need `target` and `audio_path`.
+"""
+import asyncio
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+SKILL_DIR = os.path.dirname(os.path.realpath(__file__))
+VENV_DIR = os.path.join(SKILL_DIR, ".venv")
+VENV_PYTHON = os.path.join(VENV_DIR, "bin", "python3")
+VENV_PIP = os.path.join(VENV_DIR, "bin", "pip")
+REQUIREMENTS = os.path.join(SKILL_DIR, "requirements.txt")
+DEPS_MARKER = os.path.join(VENV_DIR, ".deps-installed")
+IN_VENV_FLAG = "TELEGRAM_CALL_VENV_BOOTSTRAPPED"
+
+
+def _emit(success: bool, msg: str) -> None:
+    print(json.dumps({"output": msg, "success": success}), flush=True)
+
+
+def fail(msg: str) -> "None":
+    _emit(False, msg)
+    sys.exit(1)
+
+
+def ok(msg: str) -> "None":
+    _emit(True, msg)
+    sys.exit(0)
+
+
+def ensure_venv_and_reexec() -> None:
+    """First-run bootstrap: create a private venv with required deps, then
+    re-exec into it. No-op on subsequent invocations."""
+    if os.environ.get(IN_VENV_FLAG):
+        return
+    try:
+        if not os.path.exists(VENV_PYTHON):
+            subprocess.check_call(
+                [sys.executable, "-m", "venv", VENV_DIR],
+                stdout=sys.stderr, stderr=sys.stderr,
+            )
+        if not os.path.exists(DEPS_MARKER):
+            subprocess.check_call(
+                [VENV_PIP, "install", "-q", "--disable-pip-version-check",
+                 "-r", REQUIREMENTS],
+                stdout=sys.stderr, stderr=sys.stderr,
+            )
+            with open(DEPS_MARKER, "w") as f:
+                f.write("ok\n")
+    except FileNotFoundError as e:
+        fail(
+            f"Failed to bootstrap dependencies: {e}. "
+            "The system needs a working python3 with the venv module "
+            "(on Debian/Ubuntu: `apt install python3-venv`)."
+        )
+    except subprocess.CalledProcessError as e:
+        fail(
+            f"Failed to bootstrap dependencies (exit {e.returncode}). "
+            "Check the gateway logs for pip output and ensure the gateway "
+            "has network access (manifest requires_network is true)."
+        )
+    env = dict(os.environ, **{IN_VENV_FLAG: "1"})
+    os.execvpe(VENV_PYTHON, [VENV_PYTHON, __file__] + sys.argv[1:], env)
+
+
+# Bootstrap before importing pyrogram / pytgcalls.
+ensure_venv_and_reexec()
+
+# ---------------------------------------------------------------------------
+# Everything below this line runs inside the venv.
+# ---------------------------------------------------------------------------
+
+DATA_DIR = os.environ.get("OCTOS_DATA_DIR") or os.path.expanduser("~/.octos")
+WORK_DIR = os.environ.get("OCTOS_WORK_DIR") or DATA_DIR
+SESSION_DIR = os.path.join(DATA_DIR, "telegram-call")
+SESSION_NAME = "telegram-call"
+SESSION_FILE = os.path.join(SESSION_DIR, f"{SESSION_NAME}.session")
+AUTH_STATE_FILE = os.path.join(SESSION_DIR, "auth_state.json")
+# pyrogram creates the .session file as soon as it connects (before sign-in),
+# so we use a separate marker that's only written after successful auth.
+AUTH_COMPLETE_MARKER = os.path.join(SESSION_DIR, "auth_complete")
+TTS_DIR = os.path.join(WORK_DIR, "telegram-call-tts")
+
+DEFAULT_KOKORO_URL = "http://localhost:8880"
+DEFAULT_KOKORO_VOICE = "af_heart"
+
+
+def _import_pyrogram():
+    """Lazy-import pyrogram and pytgcalls. Only the make_call path needs
+    them, so we keep them out of the synthesize_speech hot path."""
+    # Pyrogram's `sync.py` calls `asyncio.get_event_loop()` at import time. In
+    # Python 3.10+ that emits a DeprecationWarning when no loop is set, and in
+    # 3.12+ it raises RuntimeError. Pre-set a loop so the import succeeds.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    import pyrogram  # noqa: F401
+    from pyrogram import Client
+    from pyrogram import errors as pyrogram_errors
+    from pytgcalls import PyTgCalls
+    from pytgcalls import filters as fl
+    from pytgcalls.types import CallConfig, ChatUpdate, MediaStream
+    return {
+        "Client": Client,
+        "errors": pyrogram_errors,
+        "PyTgCalls": PyTgCalls,
+        "fl": fl,
+        "CallConfig": CallConfig,
+        "ChatUpdate": ChatUpdate,
+        "MediaStream": MediaStream,
+    }
+
+
+def get_creds():
+    api_id_str = os.environ.get("TELEGRAM_API_ID", "").strip()
+    api_hash = os.environ.get("TELEGRAM_API_HASH", "").strip()
+    if not api_id_str or not api_hash:
+        fail(
+            "TELEGRAM_API_ID and TELEGRAM_API_HASH environment variables must "
+            "be set. Get a free API ID/hash from https://my.telegram.org/apps "
+            "and add them to your Octos profile, then retry."
+        )
+    try:
+        return int(api_id_str), api_hash
+    except ValueError:
+        fail(f"TELEGRAM_API_ID must be an integer, got {api_id_str!r}")
+
+
+def load_auth_state() -> dict:
+    try:
+        with open(AUTH_STATE_FILE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def save_auth_state(state: dict) -> None:
+    tmp = AUTH_STATE_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, AUTH_STATE_FILE)
+
+
+def clear_auth_state() -> None:
+    try:
+        os.remove(AUTH_STATE_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def auth_complete() -> bool:
+    return os.path.isfile(AUTH_COMPLETE_MARKER)
+
+
+def mark_auth_complete() -> None:
+    with open(AUTH_COMPLETE_MARKER, "w") as f:
+        f.write("ok\n")
+
+
+async def advance_auth(input_data: dict) -> None:
+    """Drive multi-step Telegram auth through the chat. Returns when the
+    session has just been established; calls fail() and exits otherwise."""
+    pg = _import_pyrogram()
+    Client = pg["Client"]
+    errors = pg["errors"]
+
+    api_id, api_hash = get_creds()
+    state = load_auth_state()
+    phone = (input_data.get("phone") or "").strip()
+    code = str(input_data.get("verification_code") or "").strip()
+    password = (input_data.get("password") or "").strip()
+
+    app = Client(
+        SESSION_NAME, api_id=api_id, api_hash=api_hash, workdir=SESSION_DIR,
+    )
+    await app.connect()
+    try:
+        # Step 3: 2FA password expected.
+        if state.get("awaiting") == "password":
+            if not password:
+                fail(
+                    "Telegram requires your 2FA cloud password to finish "
+                    "signing in. Ask the user for their cloud password and "
+                    "pass it as the `password` parameter on the next call."
+                )
+            try:
+                await app.check_password(password)
+                clear_auth_state()
+                mark_auth_complete()
+                return
+            except errors.PasswordHashInvalid:
+                fail(
+                    "The 2FA password was incorrect. Ask the user to try "
+                    "again and pass a fresh `password`."
+                )
+
+        # Step 2: verification code expected.
+        if state.get("awaiting") == "code":
+            if not code:
+                fail(
+                    f"Waiting for the verification code Telegram sent to "
+                    f"{state['phone']}. Ask the user to read it from their "
+                    "Telegram app (or SMS) and pass it as the "
+                    "`verification_code` parameter."
+                )
+            try:
+                signed = await app.sign_in(
+                    state["phone"], state["phone_code_hash"], code,
+                )
+                if signed is not None:
+                    clear_auth_state()
+                    mark_auth_complete()
+                    return
+            except errors.SessionPasswordNeeded:
+                state["awaiting"] = "password"
+                save_auth_state(state)
+                fail(
+                    "Telegram has 2FA enabled on this account. Ask the user "
+                    "for their cloud password and pass it as the `password` "
+                    "parameter on the next call."
+                )
+            except (errors.PhoneCodeInvalid, errors.PhoneCodeExpired) as e:
+                clear_auth_state()
+                fail(
+                    f"Verification code was rejected ({type(e).__name__}). "
+                    "Auth state has been reset. Ask the user to provide their "
+                    "phone number again as `phone` to restart."
+                )
+
+        # Step 1: phone number expected.
+        if not phone:
+            fail(
+                "Telegram is not authenticated yet. Ask the user for their "
+                "Telegram phone number (with international country code, "
+                "e.g. +44 7700 900000) and pass it as the `phone` parameter."
+            )
+        try:
+            sent = await app.send_code(phone)
+        except errors.PhoneNumberInvalid:
+            fail(
+                f"Telegram says {phone!r} is not a valid phone number. Ask "
+                "the user to double-check and provide a fresh `phone` "
+                "(must include country code, e.g. +44…)."
+            )
+        except errors.BadRequest as e:
+            fail(f"Telegram rejected the phone number: {e}")
+        save_auth_state({
+            "awaiting": "code",
+            "phone": phone,
+            "phone_code_hash": sent.phone_code_hash,
+        })
+        fail(
+            f"A verification code was sent to {phone} via Telegram. Ask the "
+            "user to read it from their Telegram app (or SMS) and pass it "
+            "as the `verification_code` parameter on the next call."
+        )
+    finally:
+        try:
+            await app.disconnect()
+        except Exception:
+            pass
+
+
+async def make_call_flow(target: str, audio_path: str, message: str) -> None:
+    pg = _import_pyrogram()
+    Client = pg["Client"]
+    errors = pg["errors"]
+    PyTgCalls = pg["PyTgCalls"]
+    fl = pg["fl"]
+    CallConfig = pg["CallConfig"]
+    ChatUpdate = pg["ChatUpdate"]
+    MediaStream = pg["MediaStream"]
+
+    api_id, api_hash = get_creds()
+    if not os.path.isfile(audio_path):
+        fail(f"Audio file not found: {audio_path}")
+
+    ring_timeout = int(os.environ.get("TELEGRAM_CALL_RING_TIMEOUT", "30"))
+    max_duration = float(os.environ.get("TELEGRAM_CALL_MAX_DURATION", "90"))
+
+    app = Client(
+        SESSION_NAME, api_id=api_id, api_hash=api_hash, workdir=SESSION_DIR,
+        no_updates=False,
+    )
+    tgcalls = PyTgCalls(app)
+    call_ended = asyncio.Event()
+    end_reason = {"value": "completed"}
+
+    @tgcalls.on_update(fl.stream_end())
+    async def _on_stream_end(_, __):
+        end_reason["value"] = "stream_finished"
+        call_ended.set()
+
+    @tgcalls.on_update(fl.chat_update(ChatUpdate.Status.LEFT_CALL))
+    async def _on_left(_, update):
+        status = update.status
+        if status & ChatUpdate.Status.BUSY_CALL:
+            end_reason["value"] = "busy"
+        elif status & ChatUpdate.Status.DISCARDED_CALL:
+            end_reason["value"] = "discarded"
+        elif end_reason["value"] == "completed":
+            end_reason["value"] = "left"
+        call_ended.set()
+
+    user_id = None
+    started_app = False
+    started_calls = False
+    try:
+        await app.start()
+        started_app = True
+        await tgcalls.start()
+        started_calls = True
+
+        try:
+            user = await app.get_users(target)
+        except errors.RPCError as e:
+            fail(
+                f"Could not resolve target {target!r}: {e}. Phone numbers "
+                "only work if the user is in your contacts; prefer @username "
+                "or numeric user_id."
+            )
+        user_id = user.id
+
+        try:
+            await tgcalls.play(
+                user_id,
+                MediaStream(audio_path, video_flags=MediaStream.Flags.IGNORE),
+                config=CallConfig(timeout=ring_timeout),
+            )
+        except FileNotFoundError as e:
+            fail(f"ffmpeg could not read audio file {audio_path!r}: {e}")
+        except Exception as e:
+            fail(f"Failed to start call to {target!r}: {type(e).__name__}: {e}")
+
+        try:
+            await asyncio.wait_for(call_ended.wait(), timeout=max_duration)
+        except asyncio.TimeoutError:
+            end_reason["value"] = "max_duration_exceeded"
+
+        descriptor = message or audio_path
+        reason = end_reason["value"]
+        if reason in ("stream_finished", "left", "completed"):
+            ok(f"Call completed ({reason}): {descriptor}")
+        elif reason == "busy":
+            fail(f"Call to {target!r} was busy: {descriptor}")
+        elif reason == "discarded":
+            fail(f"Call to {target!r} was declined or not answered: {descriptor}")
+        else:
+            ok(f"Call hung up after {max_duration}s ({reason}): {descriptor}")
+    finally:
+        if started_calls and user_id is not None:
+            try:
+                await tgcalls.leave_call(user_id)
+            except Exception:
+                pass
+        if started_app:
+            try:
+                await app.stop()
+            except Exception:
+                pass
+
+
+def synthesize_speech_tool(input_data: dict) -> None:
+    """POST to a Kokoro-FastAPI server (OpenAI-compatible /v1/audio/speech),
+    save the resulting mp3 under $OCTOS_WORK_DIR/telegram-call-tts/, and
+    return the path so the agent can chain it into make_call."""
+    text = (input_data.get("text") or "").strip()
+    if not text:
+        fail(
+            "Missing 'text' parameter. Pass the spoken message you want to "
+            "synthesize as `text` (e.g. 'Hi Alice, this is an automated "
+            "alert: there may be a gas leak in your house, please check.')."
+        )
+    if len(text) > 4000:
+        fail(
+            f"`text` is {len(text)} characters; please keep messages under "
+            "4000 characters per call."
+        )
+
+    voice = (input_data.get("voice")
+             or os.environ.get("KOKORO_VOICE", DEFAULT_KOKORO_VOICE)).strip()
+    try:
+        speed = float(input_data.get("speed")
+                      or os.environ.get("KOKORO_SPEED", "1.0"))
+    except (TypeError, ValueError):
+        fail(f"`speed` must be a number, got {input_data.get('speed')!r}")
+
+    kokoro_url = os.environ.get("KOKORO_URL", DEFAULT_KOKORO_URL).rstrip("/")
+    timeout = float(os.environ.get("KOKORO_TIMEOUT", "120"))
+
+    os.makedirs(TTS_DIR, exist_ok=True)
+    cache_key = hashlib.sha256(
+        f"{voice}|{speed}|{text}".encode("utf-8")
+    ).hexdigest()[:16]
+    out_path = os.path.join(TTS_DIR, f"{cache_key}.mp3")
+
+    if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+        ok(
+            f"Reusing cached TTS audio at {out_path} "
+            f"({os.path.getsize(out_path)} bytes). "
+            f"Now call `make_call` with audio_path={out_path!r} to play it."
+        )
+
+    body = json.dumps({
+        "model": "kokoro",
+        "input": text,
+        "voice": voice,
+        "speed": speed,
+        "response_format": "mp3",
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"{kokoro_url}/v1/audio/speech",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            audio = resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            detail = ""
+        fail(
+            f"Kokoro-FastAPI returned HTTP {e.code} from {kokoro_url}: "
+            f"{detail or e.reason}"
+        )
+    except urllib.error.URLError as e:
+        fail(
+            f"Could not reach Kokoro-FastAPI at {kokoro_url}: {e.reason}. "
+            "Make sure the Kokoro server is running on localhost:8880 (or "
+            "set the KOKORO_URL environment variable)."
+        )
+    except TimeoutError:
+        fail(
+            f"Kokoro-FastAPI at {kokoro_url} did not respond within "
+            f"{timeout}s. Increase KOKORO_TIMEOUT or check the server."
+        )
+
+    if not audio:
+        fail(f"Kokoro-FastAPI at {kokoro_url} returned an empty response.")
+
+    tmp = out_path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(audio)
+    os.replace(tmp, out_path)
+
+    ok(
+        f"Generated TTS audio at {out_path} ({len(audio)} bytes). "
+        f"Now call `make_call` with audio_path={out_path!r} to play it."
+    )
+
+
+async def amain_make_call(input_data: dict) -> None:
+    if not auth_complete() or load_auth_state():
+        await advance_auth(input_data)
+        # advance_auth either raises (via fail) or returns once the session
+        # is fully authenticated. Fall through to the call.
+
+    target = (input_data.get("target") or "").strip()
+    audio_path = input_data.get("audio_path", "")
+    message = input_data.get("message", "")
+
+    if not target:
+        fail(
+            "Missing 'target' parameter. Ask the user who to call on Telegram "
+            "and pass it as 'target' on the next call. Accepted forms: "
+            "@username, numeric user_id, or +phone_number (phone numbers only "
+            "work if the user is already in your contacts)."
+        )
+    if not audio_path:
+        fail(
+            "Missing 'audio_path' parameter. If the user wants to convey a "
+            "spoken message rather than a pre-recorded file, first call the "
+            "`synthesize_speech` tool with the text — it will return a path "
+            "you can pass back here as `audio_path`."
+        )
+
+    await make_call_flow(target, audio_path, message)
+
+
+def main() -> None:
+    tool_name = sys.argv[1] if len(sys.argv) > 1 else "unknown"
+
+    try:
+        raw = sys.stdin.read()
+    except Exception as e:
+        fail(f"Failed to read stdin: {e}")
+
+    try:
+        input_data = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError as e:
+        fail(f"Invalid JSON input: {e}")
+
+    if tool_name == "synthesize_speech":
+        try:
+            synthesize_speech_tool(input_data)
+        except SystemExit:
+            raise
+        except Exception as e:
+            fail(f"TTS failed: {type(e).__name__}: {e}")
+        return
+
+    if tool_name == "make_call":
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        try:
+            asyncio.run(amain_make_call(input_data))
+        except SystemExit:
+            raise
+        except Exception as e:
+            fail(f"Telegram call failed: {type(e).__name__}: {e}")
+        return
+
+    fail(f"Unknown tool: {tool_name}")
+
+
+if __name__ == "__main__":
+    main()

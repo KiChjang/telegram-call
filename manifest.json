@@ -1,0 +1,66 @@
+{
+  "name": "telegram-call",
+  "version": "0.3.0",
+  "author": "Keith Yeung",
+  "description": "Places a 1-on-1 Telegram voice call to a user, plays an audio file, and hangs up. Includes a TTS tool that turns text into a playable mp3 via a local Kokoro-FastAPI server. Self-installs and self-authenticates on first use.",
+  "timeout_secs": 600,
+  "requires_network": true,
+  "tools": [
+    {
+      "name": "synthesize_speech",
+      "description": "Convert a text message into an mp3 audio file using a local Kokoro-FastAPI server (default http://localhost:8880, override via KOKORO_URL env). Returns the absolute path of the generated audio file. Use this whenever the user asks to call someone with a spoken message rather than a pre-recorded file (e.g. 'call @alice about a possible gas leak'): first call this tool with the spoken text, then pass the returned path to `make_call` as `audio_path`. Results are cached by (voice, speed, text) hash so calling twice with the same args is free.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The message to speak. Should be a complete, natural-sounding spoken message — write it the way you'd say it out loud. Example: 'Hi Alice, this is an automated alert. There may be a gas leak in your house. Please check immediately and call emergency services if you smell gas.'"
+          },
+          "voice": {
+            "type": "string",
+            "description": "Optional Kokoro voice name (e.g. 'af_heart', 'af_bella', 'af_nicole', 'am_michael', 'bf_emma', 'bm_george'). Defaults to 'af_heart' or the KOKORO_VOICE env var."
+          },
+          "speed": {
+            "type": "number",
+            "description": "Optional speech rate multiplier (1.0 = normal, 0.5 = slow, 1.5 = fast). Defaults to 1.0."
+          }
+        },
+        "required": ["text"]
+      }
+    },
+    {
+      "name": "make_call",
+      "description": "Place a 1-on-1 Telegram voice call to a user, play an audio file, and hang up. The very first invocation transparently sets up Python dependencies (~30-90s) and walks the user through a one-time Telegram login: it will return success=false asking for `phone`, then `verification_code`, then optionally `password`, in that order. Pass each piece back on the next call as the named parameter. Once authenticated, normal calls only need `target` and `audio_path`. If the user asked you to convey a spoken message (no pre-recorded file given), first call `synthesize_speech` to turn the text into an mp3, then pass that path here. If `target` is missing, ASK the user — do not invent one.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string",
+            "description": "Who to call on Telegram. Accepts @username, numeric user_id, or +phone_number (phone numbers only resolve if that user is already in the caller's Telegram contacts; prefer @username when in doubt). If the user has not specified a target, ASK them rather than guessing."
+          },
+          "audio_path": {
+            "type": "string",
+            "description": "Absolute path to the audio file to play during the call. Any format ffmpeg can decode is accepted (mp3, wav, ogg, m4a, opus, ...). Typically obtained by first calling `synthesize_speech` with the spoken text."
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable description of the call, surfaced in the success/failure output."
+          },
+          "phone": {
+            "type": "string",
+            "description": "ONE-TIME Telegram account phone number with international country code, e.g. +447700900000. Only provide when the skill explicitly returned a message asking for `phone`. Do NOT include this on normal calls once authenticated."
+          },
+          "verification_code": {
+            "type": "string",
+            "description": "ONE-TIME 5-digit code sent by Telegram to the user's app/SMS. Only provide when the skill explicitly returned a message asking for `verification_code`. Do NOT include this on normal calls once authenticated."
+          },
+          "password": {
+            "type": "string",
+            "description": "ONE-TIME Telegram 2FA cloud password. Only provide when the skill explicitly returned a message asking for `password`. Do NOT include this on normal calls once authenticated."
+          }
+        },
+        "required": ["audio_path"]
+      }
+    }
+  ]
+}
