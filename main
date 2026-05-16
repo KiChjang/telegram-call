@@ -219,9 +219,15 @@ async def send_phone_code(phone: str) -> None:
             "phone_code_hash": sent.phone_code_hash,
         })
         fail(
-            f"A verification code was sent to {phone} via Telegram. Ask the "
-            "user to read it from their Telegram app (or SMS) and pass it "
-            "to the `verify_telegram_code` tool as the `code` parameter. Do "
+            f"Telegram has issued a verification code for {phone} (the "
+            "account that will place the call). Important: Telegram delivers "
+            "this code as an *in-app message* from the official 'Telegram' "
+            "service account to the user's existing logged-in Telegram "
+            "sessions FIRST (phone app, Telegram Desktop, etc.); it only "
+            "falls back to SMS after a minute or two, and SMS may not arrive "
+            "at all on some carriers. Tell the user to check the 'Telegram' "
+            "chat in their app for a 5-digit code, then pass that code to "
+            "the `verify_telegram_code` tool as the `code` parameter. Do "
             "NOT call `make_call` again with `phone` — that would invalidate "
             "the code that was just sent."
         )
@@ -539,11 +545,17 @@ async def amain_make_call(input_data: dict) -> None:
             # send_phone_code always exits via fail() with instructions.
             return
         fail(
-            "Telegram is not authenticated yet. Ask the user for their "
-            "Telegram phone number (with international country code, "
-            "e.g. +44 7700 900000) and call `make_call` again with `phone` "
-            "set. After Telegram texts a verification code, the agent should "
-            "call the `verify_telegram_code` tool, NOT `make_call` again."
+            "Telegram is not authenticated yet. Ask the user for the phone "
+            "number of the Telegram account that should PLACE the call "
+            "(this is the user's OWN Telegram account, NOT the recipient's "
+            "number — the recipient is given via `target` later). It must "
+            "include the international country code, e.g. '+447700900000'. "
+            "Then call `make_call` again with `phone` set to that value. "
+            "Telegram will deliver a 5-digit verification code to the user's "
+            "existing Telegram sessions (in-app message from the 'Telegram' "
+            "service account) before falling back to SMS. After Telegram "
+            "issues the code, the agent must call `verify_telegram_code` "
+            "with the `code` parameter — NOT `make_call` again."
         )
 
     target = (input_data.get("target") or "").strip()
@@ -588,8 +600,12 @@ async def amain_verify(input_data: dict) -> None:
     if awaiting == "code":
         if not code:
             fail(
-                f"A verification code was sent to {state.get('phone')!r}. "
-                "Pass it as the `code` parameter to this tool."
+                f"A verification code was sent for the Telegram account "
+                f"{state.get('phone')!r} (the account that will place the "
+                "call). Tell the user to look for an in-app message from "
+                "the 'Telegram' service account in their existing logged-in "
+                "Telegram session(s); SMS is a delayed fallback. Pass the "
+                "5-digit code to this tool as the `code` parameter."
             )
         await verify_phone_code(code)
         ok(

@@ -69,17 +69,27 @@ was already sent.
 Initiates the auth flow (when `phone` is supplied) or places the actual
 Telegram call (when authenticated). Same tool, two phases.
 
+> **Two phone numbers, two parameters.** The skill deals with two distinct
+> Telegram identities:
+>
+> - `phone` — your **own** Telegram account, the one **placing** the call.
+>   Used only during the one-time login.
+> - `target` — the **recipient**, the one being called.
+>
+> They are not interchangeable. `phone` is your number; `target` is theirs.
+
 **Parameters:**
 
-- `target` (effectively required for actual calls): `@username`, numeric
-  `user_id`, or `+phone_number`. Phone numbers only resolve if that user is
-  already in your Telegram contacts.
+- `target` (effectively required for actual calls): the **recipient** —
+  `@username`, numeric `user_id`, or `+phone_number` (phone numbers only
+  resolve if that user is already in your Telegram contacts).
 - `audio_path` (required): absolute path to an audio file. Any format
   `ffmpeg` can decode is accepted; usually the path returned by
   `synthesize_speech`.
 - `message` (optional): human-readable description surfaced in the result.
-- `phone` (one-time): the account's Telegram phone number with country
-  code. Provide this on the very first authentication step to receive a
+- `phone` (one-time, first-login only): the **caller's** own Telegram
+  account number, with international country code, e.g. `+447700900000`.
+  Provide this on the very first authentication step to receive a
   verification code. **Do not include `phone` again after a code has been
   sent** — use `verify_telegram_code` instead. Do not include it on normal
   calls once authenticated.
@@ -100,13 +110,17 @@ User: "call @alice about a possible gas leak in her house"
 2. **(First time only) Authenticate Telegram:**
    Agent → `make_call({target: "@alice", audio_path: "/.../abc.mp3"})`
    Skill returns: *"Telegram is not authenticated yet. Ask the user for
-   their phone number…"*
-   Agent → user → user replies `+447700900000`.
+   the phone number of the Telegram account that should PLACE the call
+   (this is the user's OWN account, NOT the recipient's number)…"*
+   Agent → user → user replies `+447700900000` (their own number).
    Agent → `make_call({target, audio_path, phone: "+447700900000"})`
-   Skill sends a code via Telegram and returns: *"A verification code was
-   sent to +447700900000. Ask the user for the code and pass it to
-   `verify_telegram_code` as `code`."*
-   Agent → user → user replies with the code.
+   Skill calls `auth.sendCode` and returns: *"Telegram has issued a
+   verification code for +447700900000 … Telegram delivers this as an
+   in-app message from the official 'Telegram' service account to the
+   user's existing logged-in sessions FIRST; SMS is a fallback. Tell the
+   user to check the 'Telegram' chat in their app for a 5-digit code,
+   then pass it to `verify_telegram_code` as `code`."*
+   Agent → user → user reads the code from their Telegram app → replies.
    Agent → `verify_telegram_code({code: "12345"})`
    On success: *"Telegram sign-in complete. The agent can now call
    `make_call` to place the actual call."*

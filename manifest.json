@@ -30,7 +30,7 @@
     },
     {
       "name": "verify_telegram_code",
-      "description": "Submit a Telegram verification code (or 2FA cloud password) during the one-time login flow. ONLY use this AFTER `make_call` returned a message asking for a code or password — never as the first step. The tool figures out from internal state whether to verify a `code` or a `password`; pass whichever one the user supplied. If Telegram rejects the value as invalid (a typo), the auth state is preserved so you can retry by calling this tool again with a corrected value — do NOT call `make_call` with `phone` again, that would invalidate the code that was already sent. After this tool succeeds you can call `make_call` to place the actual call.",
+      "description": "Submit a Telegram verification code (or 2FA cloud password) during the one-time login flow. ONLY use this AFTER `make_call` returned a message asking for a code or password — never as the first step. The tool figures out from internal state whether to verify a `code` or a `password`; pass whichever one the user supplied. NOTE on where the code comes from: when Telegram issues a login code it is delivered as an in-app message from the official 'Telegram' service account to the user's existing logged-in Telegram sessions (their phone app, Telegram Desktop, etc.); SMS is a slow fallback that may take a minute or more, or fail silently on some carriers. If the user says they 'didn't get a code', tell them to check the 'Telegram' chat in their app first. If Telegram rejects the value as invalid (a typo), the auth state is preserved so you can retry by calling this tool again with a corrected value — do NOT call `make_call` with `phone` again, that would invalidate the code that was already sent. After this tool succeeds you can call `make_call` to place the actual call.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -47,13 +47,13 @@
     },
     {
       "name": "make_call",
-      "description": "Place a 1-on-1 Telegram voice call to a user, play an audio file, and hang up. The very first invocation transparently sets up Python dependencies (~30-90s) and walks the user through a one-time Telegram login. The login flow is: (a) call `make_call` with `phone` set to the user's Telegram number to trigger an SMS/in-app verification code; (b) call the SEPARATE `verify_telegram_code` tool with the `code` (and `password` if 2FA is enabled) — DO NOT call `make_call` with `phone` again after a code has been sent or you will invalidate it; (c) once verification succeeds, call `make_call` again with `target` and `audio_path` to actually place the call. If the user asked you to convey a spoken message (no pre-recorded file given), first call `synthesize_speech` to turn the text into an mp3, then pass that path here as `audio_path`. If `target` is missing, ASK the user — do not invent one.",
+      "description": "Place a 1-on-1 Telegram voice call to a user, play an audio file, and hang up. The very first invocation transparently sets up Python dependencies (~30-90s) and walks the user through a one-time Telegram login. IMPORTANT: there are TWO distinct phone numbers in this skill — `phone` (this parameter) is the Telegram account that PLACES the call, i.e. the user's own account; `target` is the RECIPIENT being called. They are not the same. The login flow is: (a) call `make_call` with `phone` set to the USER'S OWN Telegram number to trigger a verification code (delivered as an in-app message to their existing Telegram sessions first, SMS is a slow fallback); (b) call the SEPARATE `verify_telegram_code` tool with the `code` (and `password` if 2FA is enabled) — DO NOT call `make_call` with `phone` again after a code has been sent or you will invalidate it; (c) once verification succeeds, call `make_call` again with `target` and `audio_path` to actually place the call. If the user asked you to convey a spoken message (no pre-recorded file given), first call `synthesize_speech` to turn the text into an mp3, then pass that path here as `audio_path`. If `target` is missing, ASK the user — do not invent one.",
       "input_schema": {
         "type": "object",
         "properties": {
           "target": {
             "type": "string",
-            "description": "Who to call on Telegram. Accepts @username, numeric user_id, or +phone_number (phone numbers only resolve if that user is already in the caller's Telegram contacts; prefer @username when in doubt). If the user has not specified a target, ASK them rather than guessing."
+            "description": "Who to call on Telegram — i.e. the RECIPIENT. NOT the same as `phone` (which is the caller's own account during one-time auth). Accepts @username, numeric user_id, or +phone_number (phone numbers only resolve if that user is already in the caller's Telegram contacts; prefer @username when in doubt). If the user has not specified a target, ASK them rather than guessing."
           },
           "audio_path": {
             "type": "string",
@@ -65,7 +65,7 @@
           },
           "phone": {
             "type": "string",
-            "description": "ONE-TIME Telegram account phone number with international country code, e.g. +447700900000. Only provide this on the FIRST authentication step to trigger a verification code. Do NOT include `phone` again after a code has been sent (use `verify_telegram_code` instead) and do NOT include it on normal calls once authenticated."
+            "description": "ONE-TIME, FIRST-LOGIN ONLY: phone number of the Telegram account that will PLACE the call — i.e. the user's OWN Telegram account. This is NOT the recipient's phone number (the recipient is given as `target`). Use international country-code format, e.g. '+447700900000', no spaces. Only provide this on the FIRST authentication step to trigger a verification code. Do NOT include `phone` again after a code has been sent (use `verify_telegram_code` instead). Do NOT include it on normal calls once authenticated."
           }
         },
         "required": ["audio_path"]
