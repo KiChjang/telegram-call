@@ -1,6 +1,6 @@
 {
   "name": "telegram-call",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "author": "Keith Yeung",
   "description": "Synthesizes spoken audio from text via a local Kokoro-FastAPI server and places a 1-on-1 Telegram voice call that plays it. Self-installs and self-authenticates on first use; auth has a dedicated verification tool so a wrong code can be retried without invalidating it.",
   "timeout_secs": 600,

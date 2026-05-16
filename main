@@ -23,6 +23,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -324,6 +325,7 @@ async def send_phone_code(phone: str) -> None:
             "phone_code_hash": sent.phone_code_hash,
             "sent_type": getattr(getattr(sent, "type", None), "name", None),
             "next_type": getattr(getattr(sent, "next_type", None), "name", None),
+            "code_issued_at": int(time.time()),
         })
         fail(_build_code_sent_message(phone, sent, action="issued"))
     finally:
@@ -386,6 +388,7 @@ async def resend_phone_code() -> None:
             "phone_code_hash": sent.phone_code_hash,
             "sent_type": getattr(getattr(sent, "type", None), "name", None),
             "next_type": getattr(getattr(sent, "next_type", None), "name", None),
+            "code_issued_at": int(time.time()),
         })
         msg = _build_code_sent_message(phone, sent, action="resent")
         msg += (
@@ -414,6 +417,18 @@ async def verify_phone_code(code: str) -> None:
             "flow by calling `make_call` with the user's `phone` first."
         )
 
+    issued_at = state.get("code_issued_at") or 0
+    elapsed = (int(time.time()) - issued_at) if issued_at else None
+    elapsed_str = (
+        f"~{_humanize_seconds(elapsed)} ({elapsed}s)" if elapsed is not None
+        else "an unknown duration"
+    )
+    hash_prefix = (state.get("phone_code_hash") or "")[:8]
+    sent_label = _SENT_CODE_LABELS.get(
+        state.get("sent_type") or "", "an in-app Telegram message"
+    )
+    next_label = _SENT_CODE_LABELS.get(state.get("next_type") or "", None)
+
     app, pg = await _auth_client()
     errors = pg["errors"]
     try:
@@ -425,6 +440,10 @@ async def verify_phone_code(code: str) -> None:
                 clear_auth_state()
                 mark_auth_complete()
                 return
+            # signed == None typically means TermsOfService accepted; treat as success.
+            clear_auth_state()
+            mark_auth_complete()
+            return
         except errors.SessionPasswordNeeded:
             state["awaiting"] = "password"
             save_auth_state(state)
@@ -438,17 +457,61 @@ async def verify_phone_code(code: str) -> None:
             # the phone again would trigger a new send_code and invalidate
             # the code that was actually sent.
             fail(
-                f"Telegram rejected the code {code!r} as invalid (likely a "
-                "typo). Ask the user to double-check the digits and call "
-                "`verify_telegram_code` again with the correct `code`. Do "
-                "NOT restart the auth flow."
+                f"Telegram rejected the code {code!r} as invalid (typo "
+                f"or wrong code). The code was issued {elapsed_str} ago "
+                f"via {sent_label} (hash prefix {hash_prefix!r}). The "
+                "auth state is preserved — ask the user to read the code "
+                "off their Telegram app again and call `verify_telegram_code` "
+                "with the correct `code`. Do NOT restart the auth flow."
             )
         except errors.PhoneCodeExpired:
-            clear_auth_state()
+            # KEEP state. Telegram says the code is expired, but the
+            # phone_code_hash is still potentially usable for `resend_code`,
+            # which will issue a fresh code via the next channel without
+            # tearing down the whole auth attempt.
+            msg = (
+                f"Telegram says the verification code has expired "
+                f"(PHONE_CODE_EXPIRED). It was issued {elapsed_str} ago via "
+                f"{sent_label} (hash prefix {hash_prefix!r}). "
+            )
+            if elapsed is not None and elapsed < 60:
+                msg += (
+                    "Since this was less than a minute ago, the most likely "
+                    "explanation is that an EARLIER code from a previous "
+                    "attempt was being submitted by mistake — ask the user "
+                    "to double-check they're reading the *most recent* "
+                    "5-digit code in their Telegram app, not an older one. "
+                )
+            else:
+                msg += (
+                    "Telegram codes are valid for only a few minutes; this "
+                    "one has aged out. "
+                )
+            msg += (
+                "RECOVERY: call `verify_telegram_code` with `resend: true` "
+                "to ask Telegram to issue a fresh code"
+            )
+            if next_label:
+                msg += f" (next channel: {next_label})"
+            msg += (
+                ". Only fall back to `make_call` with `phone` if resend "
+                "also fails."
+            )
+            fail(msg)
+        except errors.FloodWait as e:
+            wait = _flood_wait_seconds(e)
             fail(
-                "The verification code has expired (Telegram codes are "
-                "short-lived). Call `make_call` with the user's `phone` "
-                "again to receive a fresh code."
+                f"Telegram is rate-limiting sign-in attempts. Wait "
+                f"{_humanize_seconds(wait)} ({wait}s) before calling "
+                "`verify_telegram_code` again."
+            )
+        except errors.RPCError as e:
+            fail(
+                f"Telegram rejected the verification: {type(e).__name__}: "
+                f"{e}. Code was issued {elapsed_str} ago via {sent_label} "
+                f"(hash prefix {hash_prefix!r}). Auth state has been "
+                "preserved. If this is unexpected, see SKILL.md for how to "
+                "fully reset auth state."
             )
     finally:
         try:
@@ -719,15 +782,30 @@ async def amain_make_call(input_data: dict) -> None:
 
     if not auth_complete():
         if awaiting == "code":
+            # Escape hatch: if the agent is supplying a *different* phone
+            # than the one currently being verified, the user wants to
+            # switch to a different Telegram account. Tear down state and
+            # restart with the new phone.
+            if phone and _phone_digits(phone) and \
+                    _phone_digits(phone) != _phone_digits(state.get("phone", "")):
+                clear_auth_state()
+                await send_phone_code(phone)
+                return
             sent_label = _SENT_CODE_LABELS.get(
                 state.get("sent_type") or "", "an in-app Telegram message"
             )
             next_label = _SENT_CODE_LABELS.get(state.get("next_type") or "", None)
+            issued_at = state.get("code_issued_at") or 0
+            age = int(time.time()) - issued_at if issued_at else None
+            age_hint = (
+                f" (issued ~{_humanize_seconds(age)} ago)"
+                if age is not None else ""
+            )
             msg = (
                 f"Telegram is awaiting the verification code that was sent "
                 f"to {state['phone']} (the user's OWN Telegram account, "
-                f"which is being authenticated) via {sent_label}. Ask the "
-                "user for the code and call the `verify_telegram_code` "
+                f"which is being authenticated) via {sent_label}{age_hint}. "
+                "Ask the user for the code and call the `verify_telegram_code` "
                 "tool with it as `code`. Do NOT call `make_call` again "
                 "until verification succeeds — calling it with `phone` "
                 "would invalidate the code."

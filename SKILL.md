@@ -1,7 +1,7 @@
 ---
 name: telegram-call
 description: Synthesize a spoken message and place an outgoing 1-on-1 Telegram voice call that plays it. Self-installs and self-authenticates on first use. Triggers: call me, phone call, voice call, urgent notification, call X about Y, tell X.
-version: 0.4.1
+version: 0.4.2
 author: Keith Yeung
 always: false
 requires_bins: python3,ffmpeg
