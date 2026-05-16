@@ -50,25 +50,55 @@ def ok(msg: str) -> "None":
     sys.exit(0)
 
 
+def _requirements_fingerprint() -> str:
+    """SHA-256 of requirements.txt, used to detect when deps have been
+    edited so we can rebuild the venv from scratch on the next run."""
+    import hashlib
+    try:
+        with open(REQUIREMENTS, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return ""
+
+
 def ensure_venv_and_reexec() -> None:
     """First-run bootstrap: create a private venv with required deps, then
-    re-exec into it. No-op on subsequent invocations."""
+    re-exec into it. No-op on subsequent invocations.
+
+    The DEPS_MARKER file records the SHA-256 of requirements.txt at the
+    time of the last successful install. When the user pulls a new
+    version of the skill that bumps requirements (e.g. swapping
+    `pyrogram` for `kurigram`), the fingerprint mismatches and we wipe
+    the venv and reinstall — otherwise stale dependencies linger forever
+    and cause cryptic ImportErrors on first run."""
     if os.environ.get(IN_VENV_FLAG):
         return
+    fingerprint = _requirements_fingerprint()
+    needs_install = not os.path.exists(VENV_PYTHON)
+    if not needs_install:
+        try:
+            with open(DEPS_MARKER) as f:
+                stored = f.read().strip()
+        except OSError:
+            stored = ""
+        if stored != fingerprint:
+            needs_install = True
+            import shutil
+            shutil.rmtree(VENV_DIR, ignore_errors=True)
     try:
         if not os.path.exists(VENV_PYTHON):
             subprocess.check_call(
                 [sys.executable, "-m", "venv", VENV_DIR],
                 stdout=sys.stderr, stderr=sys.stderr,
             )
-        if not os.path.exists(DEPS_MARKER):
+        if needs_install:
             subprocess.check_call(
                 [VENV_PIP, "install", "-q", "--disable-pip-version-check",
                  "-r", REQUIREMENTS],
                 stdout=sys.stderr, stderr=sys.stderr,
             )
             with open(DEPS_MARKER, "w") as f:
-                f.write("ok\n")
+                f.write(fingerprint + "\n")
     except FileNotFoundError as e:
         fail(
             f"Failed to bootstrap dependencies: {e}. "

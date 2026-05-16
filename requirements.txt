@@ -1,3 +1,8 @@
-py-tgcalls>=2.0.0
-pyrogram>=2.0.106
+# `kurigram` is a maintained fork of `pyrogram` that ships under the same
+# `import pyrogram` namespace and includes the newer Telegram TL types
+# (e.g. `pyrogram.errors.GroupcallForbidden`) that py-tgcalls 2.2.x
+# requires at import time. The original `pyrogram` 2.0.106 on PyPI has
+# not been updated since 2023 and breaks py-tgcalls instantiation.
+kurigram>=2.2.22
+py-tgcalls>=2.2.12
 tgcrypto>=1.2.5
