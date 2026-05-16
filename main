@@ -415,6 +415,35 @@ def _humanize_seconds(s: int) -> str:
     return f"{h}h {rem // 60}m"
 
 
+def _is_send_code_unavailable(exc) -> bool:
+    """Match Telegram's `SEND_CODE_UNAVAILABLE` server-side anti-spam block.
+    Pyrogram 2.x doesn't expose a dedicated exception class for it, so we
+    match by message string. Telegram returns this when too many
+    `auth.sendCode` / `auth.resendCode` calls have been made for the same
+    number in a short window, regardless of FloodWait — there's no
+    machine-readable wait time, just a server-internal cooldown of
+    typically 1-24 hours."""
+    msg = str(exc).upper()
+    return "SEND_CODE_UNAVAILABLE" in msg
+
+
+_SEND_CODE_UNAVAILABLE_GUIDANCE = (
+    "Telegram has temporarily refused to issue any verification code for "
+    "this phone number (server error: SEND_CODE_UNAVAILABLE). This is a "
+    "Telegram-side anti-spam cooldown triggered by too many code "
+    "requests in a short window — it applies to ALL delivery channels "
+    "(APP, SMS, voice call), so retrying immediately, switching channels, "
+    "or calling `reset_telegram_auth` will NOT help and will likely "
+    "extend the cooldown. The only real fix is to WAIT — the cooldown "
+    "is typically 1-24 hours depending on how many requests were made. "
+    "Tell the user to come back later (an hour minimum, ideally tomorrow) "
+    "and try `make_call` again. If a previous code did arrive earlier in "
+    "the session and the user can still find it (e.g. in their "
+    "'Telegram' service-account chat or an SMS), they can submit it via "
+    "`verify_telegram_code` — that path doesn't require a new sendCode."
+)
+
+
 def _build_code_sent_message(phone: str, sent, action: str = "issued") -> str:
     """Format the message returned to the agent after a successful
     send_code / resend_code, telling it where Telegram routed the code."""
@@ -505,6 +534,8 @@ async def send_phone_code(phone: str) -> None:
                 "that code instead of asking for a fresh one."
             )
         except errors.BadRequest as e:
+            if _is_send_code_unavailable(e):
+                fail(_SEND_CODE_UNAVAILABLE_GUIDANCE)
             fail(f"Telegram rejected the phone number: {e}")
         save_auth_state({
             "awaiting": "code",
@@ -584,6 +615,8 @@ async def resend_phone_code() -> None:
                 "`verify_telegram_code` with `resend: true` again."
             )
         except errors.RPCError as e:
+            if _is_send_code_unavailable(e):
+                fail(_SEND_CODE_UNAVAILABLE_GUIDANCE)
             fail(
                 f"Telegram rejected the resend request: {type(e).__name__}: "
                 f"{e}. The auth state has been preserved; the user can "
@@ -599,6 +632,10 @@ async def resend_phone_code() -> None:
             "next_type": getattr(getattr(sent, "next_type", None), "name", None),
             "code_issued_at": int(time.time()),
         })
+        _debug_log(
+            f"resend OK phone={phone} hash_prefix={sent.phone_code_hash[:8]!r} "
+            f"type={getattr(getattr(sent, 'type', None), 'name', None)!r}"
+        )
         msg = _build_code_sent_message(phone, sent, action="resent")
         msg += (
             " Note: any previously-issued code for this login is now "

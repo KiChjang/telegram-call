@@ -1,7 +1,7 @@
 ---
 name: telegram-call
 description: Synthesize a spoken message and place an outgoing 1-on-1 Telegram voice call that plays it. Self-installs and self-authenticates on first use. Triggers: call me, phone call, voice call, urgent notification, call X about Y, tell X.
-version: 0.4.6
+version: 0.4.7
 author: Keith Yeung
 always: false
 requires_bins: python3,ffmpeg
@@ -91,6 +91,18 @@ If you instead see a flood-wait message (Telegram is rate-limiting code
 requests for that number), wait the indicated duration before retrying —
 sending another code immediately won't deliver and will only push the
 flood-wait window further out.
+
+#### Telegram says SEND_CODE_UNAVAILABLE?
+
+Distinct from `FloodWait`. This is a server-side anti-spam cooldown
+Telegram applies after too many `auth.sendCode` / `auth.resendCode`
+requests for the same number — it blocks **all** delivery channels
+(APP, SMS, voice call), so neither resend nor reset will help. The
+cooldown is typically 1–24 hours depending on how many requests were
+made; there's no machine-readable wait time. Just wait it out. If you
+already received a code earlier in the session and can still find it,
+you can submit it via `verify_telegram_code` — that path doesn't
+require a new sendCode and is unaffected by the cooldown.
 
 #### Telegram keeps rejecting fresh codes as expired?
 
