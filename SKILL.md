@@ -1,7 +1,7 @@
 ---
 name: telegram-call
 description: Synthesize a spoken message and place an outgoing 1-on-1 Telegram voice call that plays it. Self-installs and self-authenticates on first use. Triggers: call me, phone call, voice call, urgent notification, call X about Y, tell X.
-version: 0.4.7
+version: 0.4.8
 author: Keith Yeung
 always: false
 requires_bins: python3,ffmpeg
@@ -94,15 +94,34 @@ flood-wait window further out.
 
 #### Telegram says SEND_CODE_UNAVAILABLE?
 
-Distinct from `FloodWait`. This is a server-side anti-spam cooldown
-Telegram applies after too many `auth.sendCode` / `auth.resendCode`
-requests for the same number — it blocks **all** delivery channels
-(APP, SMS, voice call), so neither resend nor reset will help. The
-cooldown is typically 1–24 hours depending on how many requests were
-made; there's no machine-readable wait time. Just wait it out. If you
-already received a code earlier in the session and can still find it,
-you can submit it via `verify_telegram_code` — that path doesn't
-require a new sendCode and is unaffected by the cooldown.
+Per the [Telegram MTProto reference](https://core.telegram.org/method/auth.resendCode),
+this means Telegram has exhausted every delivery channel it's willing
+to use for your account — **not** a rate limit. The most common cause
+is that Telegram chose to deliver the original code through the in-app
+channel (`APP`) to one of your existing logged-in Telegram sessions
+and treats that as sufficient, with no SMS / voice-call fallback
+queued. `resend: true` then hits this error because there's nothing
+left to escalate to.
+
+Two reliable recovery paths:
+
+1. **Find the code that was already delivered.** Open the "Telegram"
+   service-account chat (top of the chat list, blue verified tick) on
+   any device you're still logged into; the code is sent as an in-app
+   message there and is easy to miss because it doesn't always ring a
+   notification. The original `phone_code_hash` is still valid, so
+   submitting it via `verify_telegram_code` with `code` will succeed.
+2. **Force SMS by removing the APP delivery target.** On a device you
+   still have access to, terminate all other Telegram sessions
+   (Settings → Devices → Terminate all other sessions). Then call
+   `reset_telegram_auth` followed by `make_call` with `phone`. With
+   no active session left, Telegram has no APP target and falls back
+   to SMS on the fresh `sendCode`.
+
+Do **not** loop on `resend: true` after this error — it will keep
+returning the same error and may push the number into a real
+`FloodWait` / `PHONE_NUMBER_FLOOD` cooldown that genuinely does
+require waiting hours.
 
 #### Telegram keeps rejecting fresh codes as expired?
 

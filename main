@@ -416,31 +416,42 @@ def _humanize_seconds(s: int) -> str:
 
 
 def _is_send_code_unavailable(exc) -> bool:
-    """Match Telegram's `SEND_CODE_UNAVAILABLE` server-side anti-spam block.
-    Pyrogram 2.x doesn't expose a dedicated exception class for it, so we
-    match by message string. Telegram returns this when too many
-    `auth.sendCode` / `auth.resendCode` calls have been made for the same
-    number in a short window, regardless of FloodWait — there's no
-    machine-readable wait time, just a server-internal cooldown of
-    typically 1-24 hours."""
+    """Match Telegram's `SEND_CODE_UNAVAILABLE` (HTTP 406) error.
+
+    Per https://core.telegram.org/method/auth.resendCode this is returned
+    "when all available options for this type of number were already
+    used" — i.e. Telegram has nothing left to escalate to, NOT a rate
+    limit. Pyrogram 2.x doesn't expose a dedicated exception class so we
+    match by message string."""
     msg = str(exc).upper()
     return "SEND_CODE_UNAVAILABLE" in msg
 
 
 _SEND_CODE_UNAVAILABLE_GUIDANCE = (
-    "Telegram has temporarily refused to issue any verification code for "
-    "this phone number (server error: SEND_CODE_UNAVAILABLE). This is a "
-    "Telegram-side anti-spam cooldown triggered by too many code "
-    "requests in a short window — it applies to ALL delivery channels "
-    "(APP, SMS, voice call), so retrying immediately, switching channels, "
-    "or calling `reset_telegram_auth` will NOT help and will likely "
-    "extend the cooldown. The only real fix is to WAIT — the cooldown "
-    "is typically 1-24 hours depending on how many requests were made. "
-    "Tell the user to come back later (an hour minimum, ideally tomorrow) "
-    "and try `make_call` again. If a previous code did arrive earlier in "
-    "the session and the user can still find it (e.g. in their "
-    "'Telegram' service-account chat or an SMS), they can submit it via "
-    "`verify_telegram_code` — that path doesn't require a new sendCode."
+    "Telegram returned SEND_CODE_UNAVAILABLE: it has exhausted every "
+    "delivery channel it's willing to use for this account — typically "
+    "because it tried to deliver via the in-app channel (APP) to one of "
+    "the user's existing logged-in Telegram sessions and considers that "
+    "sufficient, with no further fallback to SMS or voice call. This is "
+    "NOT a rate-limit / cooldown — waiting will not unlock more channels, "
+    "and another `resend: true` will hit the same error. The actual "
+    "recovery paths, in order of preference:\n"
+    "  1. Have the user open their existing Telegram session(s) and look "
+    "in the official 'Telegram' service-account chat (top of the chat "
+    "list, blue verified tick) — the code is delivered there as an "
+    "in-app message and is easy to overlook because it doesn't always "
+    "ring a notification. If found, submit it via `verify_telegram_code` "
+    "with `code`. The phone_code_hash is still valid; this works.\n"
+    "  2. If the user genuinely cannot access any existing session, ask "
+    "them to terminate all other Telegram sessions on the device(s) they "
+    "still have access to (Settings → Devices → Terminate all other "
+    "sessions). Then call `reset_telegram_auth` and `make_call` again "
+    "with `phone`: with no active sessions left, Telegram will fall "
+    "back to SMS on the fresh sendCode.\n"
+    "Do NOT loop on `resend: true` after this error — every retry will "
+    "produce the same error and may push Telegram toward a real "
+    "rate-limit (FloodWait / PHONE_NUMBER_FLOOD) that DOES require "
+    "waiting hours."
 )
 
 
