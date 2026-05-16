@@ -1,7 +1,7 @@
 ---
 name: telegram-call
 description: Synthesize a spoken message and place an outgoing 1-on-1 Telegram voice call that plays it. Self-installs and self-authenticates on first use. Triggers: call me, phone call, voice call, urgent notification, call X about Y, tell X.
-version: 0.4.5
+version: 0.4.6
 author: Keith Yeung
 always: false
 requires_bins: python3,ffmpeg
@@ -95,12 +95,18 @@ flood-wait window further out.
 #### Telegram keeps rejecting fresh codes as expired?
 
 If Telegram returns `PHONE_CODE_EXPIRED` on a code that was issued seconds
-ago, the local pyrogram session (`telegram-call.session`) has almost
-certainly desynchronised from Telegram's view — typically a stale
-`auth_key` left over from a previous DC migration. The skill detects this
-once it has happened twice in a row and tells the agent to call
+ago, the most common cause is a stale `auth_key` in the local pyrogram
+session (`telegram-call.session`): pyrogram considers a session "empty"
+until `auth.signIn` has populated `user_id` / `is_bot`, and on each
+process invocation a session it deems empty triggers a brand-new
+Diffie-Hellman handshake — orphaning the `phone_code_hash` from the
+previous process so Telegram rejects the matching code. The skill works
+around this by stamping placeholder values immediately after connect, but
+if a session was created by an older buggy version (pre-0.4.6) those
+placeholders are missing and the loop will continue. The skill detects
+two consecutive expirations and tells the agent to call
 `reset_telegram_auth`, which wipes the session file and lets the next
-`make_call` perform a clean DH key exchange.
+`make_call` perform a clean DH key exchange against the new code path.
 
 ### reset_telegram_auth
 

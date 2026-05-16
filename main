@@ -295,9 +295,50 @@ def _read_session_main_file() -> str:
         return f"session_file_read_error={type(e).__name__}: {e}"
 
 
+async def _pin_partial_session(app) -> None:
+    """Mark the storage as 'non-empty' so pyrogram reuses its auth_key on the
+    next process invocation, even if the user hasn't completed sign-in yet.
+
+    Pyrogram's `Client.load_session()` (in client.py) decides whether to do
+    a fresh Diffie-Hellman handshake based on:
+
+        session_empty = any([
+            await self.storage.test_mode() is None,
+            await self.storage.auth_key() is None,
+            await self.storage.user_id() is None,
+            await self.storage.is_bot() is None,
+        ])
+
+    `user_id` and `is_bot` are only populated when `auth.signIn` succeeds.
+    Since the Octos skill protocol is stateless across tool calls, the
+    auth flow always spans at least two processes (one to send the code,
+    one to verify it). Without pinning, the verifier process re-runs DH,
+    rotates auth_key, and orphans the phone_code_hash from the sender —
+    Telegram then returns PHONE_CODE_EXPIRED even on a freshly-issued
+    code that the user typed in correctly within seconds.
+
+    Stamping placeholder values keeps `session_empty == False`, so the
+    auth_key (and therefore the phone_code_hash binding) survives across
+    processes. Real values get written by `sign_in` / `check_password`
+    later (sign_in.py line 77+ overwrites `user_id` with the actual user
+    id and `is_bot` with the real flag), so this stamping is harmless.
+    """
+    try:
+        if await app.storage.user_id() is None:
+            await app.storage.user_id(0)
+        if await app.storage.is_bot() is None:
+            await app.storage.is_bot(False)
+    except Exception as e:
+        _debug_log(f"pin_partial_session failed: {type(e).__name__}: {e}")
+
+
 async def _auth_client():
     """Build and connect a pyrogram Client for the auth steps. Returns the
-    connected client and the lazy-imported pyrogram bundle."""
+    connected client and the lazy-imported pyrogram bundle.
+
+    Pins the storage with placeholder `user_id` / `is_bot` immediately
+    after connect so the auth_key persists across processes (see
+    `_pin_partial_session` for the gory detail)."""
     pg = _import_pyrogram()
     api_id, api_hash = get_creds()
     _debug_log(f"pre-connect on-disk: {_read_session_main_file()}")
@@ -306,28 +347,14 @@ async def _auth_client():
     )
     await app.connect()
     _debug_log(f"post-connect in-memory: {await _client_diag(app)}")
+    await _pin_partial_session(app)
     return app, pg
 
 
-async def _safe_disconnect(app) -> None:
-    """Tear down a pyrogram client AND its SQLite storage, forcing a WAL
-    checkpoint so the latest auth_key is durably written to the main
-    .session file before this process exits.
-
-    Pyrogram's `Client.disconnect()` calls `storage.save()` (which commits)
-    but never explicitly closes the SQLite connection. In WAL journal mode
-    that means the auth_key UPDATE lives in `telegram-call.session-wal`
-    until the connection is closed and SQLite checkpoints the WAL into the
-    main file. When the process exits via `sys.exit()` from inside
-    `asyncio.run()`, the connection's `__del__` race may not run before
-    the kernel reaps the process — the WAL never makes it into the main
-    file. The next process invocation opens the .session, sees a
-    `test_mode=NULL` row, classifies the session as "empty", does a fresh
-    DH exchange, and gets a brand-new auth_key. The phone_code_hash from
-    the previous process is then orphaned, and Telegram returns
-    PHONE_CODE_EXPIRED on sign_in. This helper closes the connection
-    deterministically, which forces a WAL checkpoint.
-    """
+async def _disconnect(app) -> None:
+    """Tear down a pyrogram client. Logs pre- and post-disconnect snapshots
+    of the session state when `TELEGRAM_CALL_DEBUG` is enabled, so any
+    auth_key drift across processes is easy to spot in `debug.log`."""
     pre_state = ""
     try:
         pre_state = await _client_diag(app)
@@ -335,23 +362,8 @@ async def _safe_disconnect(app) -> None:
         pass
     try:
         await app.disconnect()
-    except Exception:
-        pass
-    storage = getattr(app, "storage", None)
-    conn = getattr(storage, "conn", None) if storage is not None else None
-    if conn is not None:
-        try:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-        except Exception as e:
-            _debug_log(f"wal_checkpoint failed: {type(e).__name__}: {e}")
-        try:
-            conn.commit()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+    except Exception as e:
+        _debug_log(f"disconnect failed: {type(e).__name__}: {e}")
     if pre_state:
         _debug_log(f"pre-disconnect in-memory: {pre_state}")
     _debug_log(f"post-disconnect on-disk: {_read_session_main_file()}")
@@ -508,7 +520,7 @@ async def send_phone_code(phone: str) -> None:
         )
         fail(_build_code_sent_message(phone, sent, action="issued"))
     finally:
-        await _safe_disconnect(app)
+        await _disconnect(app)
 
 
 async def resend_phone_code() -> None:
@@ -550,14 +562,13 @@ async def resend_phone_code() -> None:
                     base + "This is the "
                     f"{streak}{'nd' if streak == 2 else 'rd' if streak == 3 else 'th'} "
                     "consecutive time Telegram has rejected a freshly-issued "
-                    "code as expired, which strongly suggests the locally-"
-                    "stored Telegram session (`telegram-call.session`) is in "
-                    "a desynchronised state — typically a stale auth_key "
-                    "from a previous DC. Call the `reset_telegram_auth` "
-                    "tool to wipe all auth artifacts (session file, "
-                    "auth_state, expired-streak counter) and start fresh. "
-                    "After that, call `make_call` with the user's `phone` "
-                    "to begin a clean authentication."
+                    "code as expired, which means the local Telegram session "
+                    "(`telegram-call.session`) holds a stale `auth_key` — most "
+                    "likely created by an older buggy version of this skill. "
+                    "Call the `reset_telegram_auth` tool to wipe all auth "
+                    "artifacts (session file, auth_state, expired-streak "
+                    "counter) and start fresh. After that, call `make_call` "
+                    "with the user's `phone` to begin a clean authentication."
                 )
             fail(
                 base + "Call `make_call` with the user's `phone` to restart "
@@ -595,7 +606,7 @@ async def resend_phone_code() -> None:
         )
         fail(msg)
     finally:
-        await _safe_disconnect(app)
+        await _disconnect(app)
 
 
 async def verify_phone_code(code: str) -> None:
@@ -679,10 +690,10 @@ async def verify_phone_code(code: str) -> None:
                     f"This is the {streak}{'nd' if streak == 2 else 'rd' if streak == 3 else 'th'} "
                     "consecutive time a fresh code has been rejected as "
                     "expired — the locally-stored Telegram session "
-                    "(`telegram-call.session`) is almost certainly "
-                    "desynchronised (e.g. a stale auth_key from a previous "
-                    "DC). RECOVERY: call the `reset_telegram_auth` tool to "
-                    "wipe all auth artifacts and start fresh, then "
+                    "(`telegram-call.session`) holds a stale `auth_key` "
+                    "(most likely created by an older buggy version of this "
+                    "skill). RECOVERY: call the `reset_telegram_auth` tool "
+                    "to wipe all auth artifacts and start fresh, then "
                     "`make_call` with the user's `phone` to restart auth."
                 )
                 fail(msg)
@@ -727,7 +738,7 @@ async def verify_phone_code(code: str) -> None:
                 "fully reset auth state."
             )
     finally:
-        await _safe_disconnect(app)
+        await _disconnect(app)
 
 
 async def verify_2fa_password(password: str) -> None:
@@ -758,7 +769,7 @@ async def verify_2fa_password(password: str) -> None:
                 "fresh `password`."
             )
     finally:
-        await _safe_disconnect(app)
+        await _disconnect(app)
 
 
 async def make_call_flow(target: str, audio_path: str, message: str) -> None:
@@ -858,24 +869,6 @@ async def make_call_flow(target: str, audio_path: str, message: str) -> None:
                 await app.stop()
             except Exception:
                 pass
-            # Force a WAL checkpoint and close the SQLite connection so any
-            # session state mutated during the call (e.g. peer cache,
-            # last-seen date) is durably written before the process exits.
-            storage = getattr(app, "storage", None)
-            conn = getattr(storage, "conn", None) if storage is not None else None
-            if conn is not None:
-                try:
-                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
-                except Exception:
-                    pass
-                try:
-                    conn.commit()
-                except Exception:
-                    pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
 
 
 def synthesize_speech_tool(input_data: dict) -> None:
