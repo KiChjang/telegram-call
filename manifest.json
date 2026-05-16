@@ -1,8 +1,8 @@
 {
   "name": "telegram-call",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "Keith Yeung",
-  "description": "Places a 1-on-1 Telegram voice call to a user, plays an audio file, and hangs up. Includes a TTS tool that turns text into a playable mp3 via a local Kokoro-FastAPI server. Self-installs and self-authenticates on first use.",
+  "description": "Synthesizes spoken audio from text via a local Kokoro-FastAPI server and places a 1-on-1 Telegram voice call that plays it. Self-installs and self-authenticates on first use; auth has a dedicated verification tool so a wrong code can be retried without invalidating it.",
   "timeout_secs": 600,
   "requires_network": true,
   "tools": [
@@ -18,7 +18,7 @@
           },
           "voice": {
             "type": "string",
-            "description": "Optional Kokoro voice name (e.g. 'af_heart', 'af_bella', 'af_nicole', 'am_michael', 'bf_emma', 'bm_george'). Defaults to 'af_heart' or the KOKORO_VOICE env var."
+            "description": "Optional Kokoro voice name (e.g. 'af_heart', 'af_bella', 'af_nova', 'am_michael', 'bf_emma', 'bm_george'). Defaults to 'af_heart' or the KOKORO_VOICE env var."
           },
           "speed": {
             "type": "number",
@@ -29,8 +29,25 @@
       }
     },
     {
+      "name": "verify_telegram_code",
+      "description": "Submit a Telegram verification code (or 2FA cloud password) during the one-time login flow. ONLY use this AFTER `make_call` returned a message asking for a code or password — never as the first step. The tool figures out from internal state whether to verify a `code` or a `password`; pass whichever one the user supplied. If Telegram rejects the value as invalid (a typo), the auth state is preserved so you can retry by calling this tool again with a corrected value — do NOT call `make_call` with `phone` again, that would invalidate the code that was already sent. After this tool succeeds you can call `make_call` to place the actual call.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The verification code Telegram sent to the user (typically 5 digits, no spaces or dashes). Provide this when `make_call` returned a 'verification code was sent' message."
+          },
+          "password": {
+            "type": "string",
+            "description": "The user's Telegram 2FA cloud password. Provide this when verification returned a '2FA enabled' message asking for `password`."
+          }
+        }
+      }
+    },
+    {
       "name": "make_call",
-      "description": "Place a 1-on-1 Telegram voice call to a user, play an audio file, and hang up. The very first invocation transparently sets up Python dependencies (~30-90s) and walks the user through a one-time Telegram login: it will return success=false asking for `phone`, then `verification_code`, then optionally `password`, in that order. Pass each piece back on the next call as the named parameter. Once authenticated, normal calls only need `target` and `audio_path`. If the user asked you to convey a spoken message (no pre-recorded file given), first call `synthesize_speech` to turn the text into an mp3, then pass that path here. If `target` is missing, ASK the user — do not invent one.",
+      "description": "Place a 1-on-1 Telegram voice call to a user, play an audio file, and hang up. The very first invocation transparently sets up Python dependencies (~30-90s) and walks the user through a one-time Telegram login. The login flow is: (a) call `make_call` with `phone` set to the user's Telegram number to trigger an SMS/in-app verification code; (b) call the SEPARATE `verify_telegram_code` tool with the `code` (and `password` if 2FA is enabled) — DO NOT call `make_call` with `phone` again after a code has been sent or you will invalidate it; (c) once verification succeeds, call `make_call` again with `target` and `audio_path` to actually place the call. If the user asked you to convey a spoken message (no pre-recorded file given), first call `synthesize_speech` to turn the text into an mp3, then pass that path here as `audio_path`. If `target` is missing, ASK the user — do not invent one.",
       "input_schema": {
         "type": "object",
         "properties": {
@@ -48,15 +65,7 @@
           },
           "phone": {
             "type": "string",
-            "description": "ONE-TIME Telegram account phone number with international country code, e.g. +447700900000. Only provide when the skill explicitly returned a message asking for `phone`. Do NOT include this on normal calls once authenticated."
-          },
-          "verification_code": {
-            "type": "string",
-            "description": "ONE-TIME 5-digit code sent by Telegram to the user's app/SMS. Only provide when the skill explicitly returned a message asking for `verification_code`. Do NOT include this on normal calls once authenticated."
-          },
-          "password": {
-            "type": "string",
-            "description": "ONE-TIME Telegram 2FA cloud password. Only provide when the skill explicitly returned a message asking for `password`. Do NOT include this on normal calls once authenticated."
+            "description": "ONE-TIME Telegram account phone number with international country code, e.g. +447700900000. Only provide this on the FIRST authentication step to trigger a verification code. Do NOT include `phone` again after a code has been sent (use `verify_telegram_code` instead) and do NOT include it on normal calls once authenticated."
           }
         },
         "required": ["audio_path"]

@@ -181,90 +181,35 @@ def mark_auth_complete() -> None:
         f.write("ok\n")
 
 
-async def advance_auth(input_data: dict) -> None:
-    """Drive multi-step Telegram auth through the chat. Returns when the
-    session has just been established; calls fail() and exits otherwise."""
+async def _auth_client():
+    """Build and connect a pyrogram Client for the auth steps. Returns the
+    connected client and the lazy-imported pyrogram bundle."""
     pg = _import_pyrogram()
-    Client = pg["Client"]
-    errors = pg["errors"]
-
     api_id, api_hash = get_creds()
-    state = load_auth_state()
-    phone = (input_data.get("phone") or "").strip()
-    code = str(input_data.get("verification_code") or "").strip()
-    password = (input_data.get("password") or "").strip()
-
-    app = Client(
+    app = pg["Client"](
         SESSION_NAME, api_id=api_id, api_hash=api_hash, workdir=SESSION_DIR,
     )
     await app.connect()
+    return app, pg
+
+
+async def send_phone_code(phone: str) -> None:
+    """Step 1 of auth: ask Telegram to send a verification code to the user's
+    phone, persist the resulting `phone_code_hash`, and exit with a message
+    telling the agent to invoke `verify_telegram_code` next.
+
+    Always exits via fail() (since this step never completes auth on its own)
+    or success-then-exit; never returns normally."""
+    app, pg = await _auth_client()
+    errors = pg["errors"]
     try:
-        # Step 3: 2FA password expected.
-        if state.get("awaiting") == "password":
-            if not password:
-                fail(
-                    "Telegram requires your 2FA cloud password to finish "
-                    "signing in. Ask the user for their cloud password and "
-                    "pass it as the `password` parameter on the next call."
-                )
-            try:
-                await app.check_password(password)
-                clear_auth_state()
-                mark_auth_complete()
-                return
-            except errors.PasswordHashInvalid:
-                fail(
-                    "The 2FA password was incorrect. Ask the user to try "
-                    "again and pass a fresh `password`."
-                )
-
-        # Step 2: verification code expected.
-        if state.get("awaiting") == "code":
-            if not code:
-                fail(
-                    f"Waiting for the verification code Telegram sent to "
-                    f"{state['phone']}. Ask the user to read it from their "
-                    "Telegram app (or SMS) and pass it as the "
-                    "`verification_code` parameter."
-                )
-            try:
-                signed = await app.sign_in(
-                    state["phone"], state["phone_code_hash"], code,
-                )
-                if signed is not None:
-                    clear_auth_state()
-                    mark_auth_complete()
-                    return
-            except errors.SessionPasswordNeeded:
-                state["awaiting"] = "password"
-                save_auth_state(state)
-                fail(
-                    "Telegram has 2FA enabled on this account. Ask the user "
-                    "for their cloud password and pass it as the `password` "
-                    "parameter on the next call."
-                )
-            except (errors.PhoneCodeInvalid, errors.PhoneCodeExpired) as e:
-                clear_auth_state()
-                fail(
-                    f"Verification code was rejected ({type(e).__name__}). "
-                    "Auth state has been reset. Ask the user to provide their "
-                    "phone number again as `phone` to restart."
-                )
-
-        # Step 1: phone number expected.
-        if not phone:
-            fail(
-                "Telegram is not authenticated yet. Ask the user for their "
-                "Telegram phone number (with international country code, "
-                "e.g. +44 7700 900000) and pass it as the `phone` parameter."
-            )
         try:
             sent = await app.send_code(phone)
         except errors.PhoneNumberInvalid:
             fail(
                 f"Telegram says {phone!r} is not a valid phone number. Ask "
                 "the user to double-check and provide a fresh `phone` "
-                "(must include country code, e.g. +44…)."
+                "(must include the country code, e.g. +44…)."
             )
         except errors.BadRequest as e:
             fail(f"Telegram rejected the phone number: {e}")
@@ -276,8 +221,101 @@ async def advance_auth(input_data: dict) -> None:
         fail(
             f"A verification code was sent to {phone} via Telegram. Ask the "
             "user to read it from their Telegram app (or SMS) and pass it "
-            "as the `verification_code` parameter on the next call."
+            "to the `verify_telegram_code` tool as the `code` parameter. Do "
+            "NOT call `make_call` again with `phone` — that would invalidate "
+            "the code that was just sent."
         )
+    finally:
+        try:
+            await app.disconnect()
+        except Exception:
+            pass
+
+
+async def verify_phone_code(code: str) -> None:
+    """Step 2 of auth: submit the verification code. Returns normally on
+    success (state cleared, auth marker written); calls fail() otherwise.
+
+    Critically, on PhoneCodeInvalid (a typo / wrong code) we KEEP the auth
+    state so the agent can retry with a fresh code — clearing it would force
+    a new send_code, invalidating the code the user already received."""
+    state = load_auth_state()
+    if state.get("awaiting") != "code":
+        fail(
+            "No verification code is currently being awaited. Start the auth "
+            "flow by calling `make_call` with the user's `phone` first."
+        )
+
+    app, pg = await _auth_client()
+    errors = pg["errors"]
+    try:
+        try:
+            signed = await app.sign_in(
+                state["phone"], state["phone_code_hash"], code,
+            )
+            if signed is not None:
+                clear_auth_state()
+                mark_auth_complete()
+                return
+        except errors.SessionPasswordNeeded:
+            state["awaiting"] = "password"
+            save_auth_state(state)
+            fail(
+                "Telegram has 2FA enabled on this account. Ask the user "
+                "for their cloud password and pass it to the "
+                "`verify_telegram_code` tool as the `password` parameter."
+            )
+        except errors.PhoneCodeInvalid:
+            # KEEP state — the user just typed the wrong digits. Asking for
+            # the phone again would trigger a new send_code and invalidate
+            # the code that was actually sent.
+            fail(
+                f"Telegram rejected the code {code!r} as invalid (likely a "
+                "typo). Ask the user to double-check the digits and call "
+                "`verify_telegram_code` again with the correct `code`. Do "
+                "NOT restart the auth flow."
+            )
+        except errors.PhoneCodeExpired:
+            clear_auth_state()
+            fail(
+                "The verification code has expired (Telegram codes are "
+                "short-lived). Call `make_call` with the user's `phone` "
+                "again to receive a fresh code."
+            )
+    finally:
+        try:
+            await app.disconnect()
+        except Exception:
+            pass
+
+
+async def verify_2fa_password(password: str) -> None:
+    """Step 3 of auth (only when 2FA is enabled): submit the cloud password.
+    Returns normally on success; calls fail() otherwise. Wrong-password
+    keeps state so the user can retry."""
+    state = load_auth_state()
+    if state.get("awaiting") != "password":
+        fail(
+            "No 2FA password is currently being awaited. Either no auth is "
+            "in progress, or the previous step expected a `code` instead. "
+            "Start with `make_call` and `phone`, then `verify_telegram_code`."
+        )
+
+    app, pg = await _auth_client()
+    errors = pg["errors"]
+    try:
+        try:
+            await app.check_password(password)
+            clear_auth_state()
+            mark_auth_complete()
+            return
+        except errors.PasswordHashInvalid:
+            # KEEP state so the user can retry the password.
+            fail(
+                "Telegram rejected the 2FA password as incorrect. Ask the "
+                "user to try again and call `verify_telegram_code` with a "
+                "fresh `password`."
+            )
     finally:
         try:
             await app.disconnect()
@@ -477,10 +515,36 @@ def synthesize_speech_tool(input_data: dict) -> None:
 
 
 async def amain_make_call(input_data: dict) -> None:
-    if not auth_complete() or load_auth_state():
-        await advance_auth(input_data)
-        # advance_auth either raises (via fail) or returns once the session
-        # is fully authenticated. Fall through to the call.
+    phone = (input_data.get("phone") or "").strip()
+    state = load_auth_state()
+    awaiting = state.get("awaiting")
+
+    if not auth_complete():
+        if awaiting == "code":
+            fail(
+                f"Telegram is awaiting the verification code that was sent "
+                f"to {state['phone']}. Ask the user for the code and call "
+                "the `verify_telegram_code` tool with it as `code`. Do NOT "
+                "call `make_call` again until verification succeeds."
+            )
+        if awaiting == "password":
+            fail(
+                "Telegram is awaiting the user's 2FA cloud password. Ask "
+                "the user for it and call the `verify_telegram_code` tool "
+                "with it as `password`. Do NOT call `make_call` again "
+                "until verification succeeds."
+            )
+        if phone:
+            await send_phone_code(phone)
+            # send_phone_code always exits via fail() with instructions.
+            return
+        fail(
+            "Telegram is not authenticated yet. Ask the user for their "
+            "Telegram phone number (with international country code, "
+            "e.g. +44 7700 900000) and call `make_call` again with `phone` "
+            "set. After Telegram texts a verification code, the agent should "
+            "call the `verify_telegram_code` tool, NOT `make_call` again."
+        )
 
     target = (input_data.get("target") or "").strip()
     audio_path = input_data.get("audio_path", "")
@@ -502,6 +566,57 @@ async def amain_make_call(input_data: dict) -> None:
         )
 
     await make_call_flow(target, audio_path, message)
+
+
+async def amain_verify(input_data: dict) -> None:
+    """Handler for the `verify_telegram_code` tool. Decides between phone
+    code and 2FA password based on the persisted auth state."""
+    if auth_complete():
+        ok(
+            "Telegram is already authenticated; nothing to verify. You can "
+            "call `make_call` directly."
+        )
+        return
+
+    state = load_auth_state()
+    awaiting = state.get("awaiting")
+    code = (input_data.get("code")
+            or input_data.get("verification_code")
+            or "").strip()
+    password = (input_data.get("password") or "").strip()
+
+    if awaiting == "code":
+        if not code:
+            fail(
+                f"A verification code was sent to {state.get('phone')!r}. "
+                "Pass it as the `code` parameter to this tool."
+            )
+        await verify_phone_code(code)
+        ok(
+            "Telegram sign-in complete. The agent can now call `make_call` "
+            "to place the actual call (with `target` and `audio_path`)."
+        )
+        return
+
+    if awaiting == "password":
+        if not password:
+            fail(
+                "Telegram is awaiting the user's 2FA cloud password. Pass "
+                "it as the `password` parameter to this tool."
+            )
+        await verify_2fa_password(password)
+        ok(
+            "2FA verification successful. The agent can now call "
+            "`make_call` to place the actual call."
+        )
+        return
+
+    fail(
+        "No verification step is in progress. Start the auth flow by "
+        "calling `make_call` with the user's `phone` first; this tool is "
+        "only used afterwards to submit the verification code (or 2FA "
+        "password) that Telegram requested."
+    )
 
 
 def main() -> None:
@@ -534,6 +649,16 @@ def main() -> None:
             raise
         except Exception as e:
             fail(f"Telegram call failed: {type(e).__name__}: {e}")
+        return
+
+    if tool_name == "verify_telegram_code":
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        try:
+            asyncio.run(amain_verify(input_data))
+        except SystemExit:
+            raise
+        except Exception as e:
+            fail(f"Verification failed: {type(e).__name__}: {e}")
         return
 
     fail(f"Unknown tool: {tool_name}")
