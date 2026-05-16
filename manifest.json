@@ -1,6 +1,6 @@
 {
   "name": "telegram-call",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "author": "Keith Yeung",
   "description": "Synthesizes spoken audio from text via a local Kokoro-FastAPI server and places a 1-on-1 Telegram voice call that plays it. Self-installs and self-authenticates on first use; auth has a dedicated verification tool so a wrong code can be retried without invalidating it.",
   "timeout_secs": 600,
@@ -26,6 +26,14 @@
           }
         },
         "required": ["text"]
+      }
+    },
+    {
+      "name": "reset_telegram_auth",
+      "description": "Wipe ALL local Telegram auth artifacts for this skill (the pyrogram .session file, auth_state.json, the auth_complete marker, and the consecutive-expired-code counter) so the next `make_call` performs a fresh DH key exchange. Use this ONLY when an in-progress login flow is genuinely stuck — typically signalled by the skill telling you Telegram has rejected freshly-issued codes as PHONE_CODE_EXPIRED twice in a row, which means the locally-stored Telegram session has desynchronised. After calling this tool, restart auth by calling `make_call` with the user's `phone`. Do not use this preemptively or to 'try again' on a single failure — it will invalidate any in-flight verification and force the user to receive a brand-new code.",
+      "input_schema": {
+        "type": "object",
+        "properties": {}
       }
     },
     {

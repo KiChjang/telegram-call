@@ -97,10 +97,15 @@ WORK_DIR = os.environ.get("OCTOS_WORK_DIR") or DATA_DIR
 SESSION_DIR = os.path.join(DATA_DIR, "telegram-call")
 SESSION_NAME = "telegram-call"
 SESSION_FILE = os.path.join(SESSION_DIR, f"{SESSION_NAME}.session")
+SESSION_JOURNAL = os.path.join(SESSION_DIR, f"{SESSION_NAME}.session-journal")
 AUTH_STATE_FILE = os.path.join(SESSION_DIR, "auth_state.json")
 # pyrogram creates the .session file as soon as it connects (before sign-in),
 # so we use a separate marker that's only written after successful auth.
 AUTH_COMPLETE_MARKER = os.path.join(SESSION_DIR, "auth_complete")
+# Counts consecutive PHONE_CODE_EXPIRED responses across send_code restarts.
+# Persisted separately from AUTH_STATE_FILE so it survives clear_auth_state().
+EXPIRED_COUNTER_FILE = os.path.join(SESSION_DIR, "expired_streak.json")
+DEBUG_LOG_FILE = os.path.join(SESSION_DIR, "debug.log")
 TTS_DIR = os.path.join(WORK_DIR, "telegram-call-tts")
 
 DEFAULT_KOKORO_URL = "http://localhost:8880"
@@ -180,6 +185,82 @@ def auth_complete() -> bool:
 def mark_auth_complete() -> None:
     with open(AUTH_COMPLETE_MARKER, "w") as f:
         f.write("ok\n")
+    # Successful auth invalidates any prior expired-code streak.
+    _reset_expired_streak()
+
+
+def _read_expired_streak() -> int:
+    try:
+        with open(EXPIRED_COUNTER_FILE) as f:
+            return int(json.load(f).get("count") or 0)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError):
+        return 0
+
+
+def _write_expired_streak(count: int) -> None:
+    try:
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        tmp = EXPIRED_COUNTER_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"count": int(count), "updated_at": int(time.time())}, f)
+        os.replace(tmp, EXPIRED_COUNTER_FILE)
+    except OSError:
+        pass
+
+
+def _reset_expired_streak() -> None:
+    try:
+        os.remove(EXPIRED_COUNTER_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def purge_session_files() -> dict:
+    """Nuke every auth artifact: auth_state.json, auth_complete marker, the
+    pyrogram .session file (and -journal), and the expired-streak counter.
+    Returns a dict describing which files were removed for surfacing back to
+    the agent."""
+    removed = []
+    not_present = []
+    for path in (AUTH_STATE_FILE, AUTH_COMPLETE_MARKER, SESSION_FILE,
+                 SESSION_JOURNAL, EXPIRED_COUNTER_FILE):
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                removed.append(os.path.basename(path))
+            except OSError as e:
+                removed.append(f"{os.path.basename(path)} (error: {e})")
+        else:
+            not_present.append(os.path.basename(path))
+    return {"removed": removed, "not_present": not_present}
+
+
+def _debug_log(msg: str) -> None:
+    """Append a line to debug.log when TELEGRAM_CALL_DEBUG is set. The log is
+    safe to keep around (no secrets — just truncated hashes / DC ids)."""
+    if not os.environ.get("TELEGRAM_CALL_DEBUG"):
+        return
+    try:
+        os.makedirs(SESSION_DIR, exist_ok=True)
+        with open(DEBUG_LOG_FILE, "a") as f:
+            f.write(f"[{time.strftime('%Y-%m-%dT%H:%M:%S')}] [{os.getpid()}] {msg}\n")
+    except OSError:
+        pass
+
+
+async def _client_diag(app) -> str:
+    """Return a short string describing the connected client's session state,
+    for use in debug logs and error surfaces. Truncates anything sensitive."""
+    try:
+        dc_id = await app.storage.dc_id()
+    except Exception:
+        dc_id = "?"
+    try:
+        ak = await app.storage.auth_key()
+        ak_prefix = ak.hex()[:8] if ak else "<none>"
+    except Exception:
+        ak_prefix = "?"
+    return f"dc={dc_id} auth_key_prefix={ak_prefix}"
 
 
 async def _auth_client():
@@ -191,6 +272,7 @@ async def _auth_client():
         SESSION_NAME, api_id=api_id, api_hash=api_hash, workdir=SESSION_DIR,
     )
     await app.connect()
+    _debug_log(f"connected: {await _client_diag(app)}")
     return app, pg
 
 
@@ -327,6 +409,10 @@ async def send_phone_code(phone: str) -> None:
             "next_type": getattr(getattr(sent, "next_type", None), "name", None),
             "code_issued_at": int(time.time()),
         })
+        _debug_log(
+            f"send_code OK phone={phone} hash_prefix={sent.phone_code_hash[:8]!r} "
+            f"type={getattr(getattr(sent, 'type', None), 'name', None)!r}"
+        )
         fail(_build_code_sent_message(phone, sent, action="issued"))
     finally:
         try:
@@ -362,10 +448,32 @@ async def resend_phone_code() -> None:
             sent = await app.resend_code(phone, phone_code_hash)
         except errors.PhoneCodeExpired:
             clear_auth_state()
-            fail(
+            streak = _read_expired_streak() + 1
+            _write_expired_streak(streak)
+            _debug_log(f"resend PHONE_CODE_EXPIRED streak={streak}")
+            base = (
                 "The previous verification code has already expired, so "
-                "Telegram won't resend it. Call `make_call` with the user's "
-                "`phone` to restart the auth flow with a fresh code."
+                "Telegram won't resend it. "
+            )
+            if streak >= 2:
+                fail(
+                    base + "This is the "
+                    f"{streak}{'nd' if streak == 2 else 'rd' if streak == 3 else 'th'} "
+                    "consecutive time Telegram has rejected a freshly-issued "
+                    "code as expired, which strongly suggests the locally-"
+                    "stored Telegram session (`telegram-call.session`) is in "
+                    "a desynchronised state — typically a stale auth_key "
+                    "from a previous DC. Call the `reset_telegram_auth` "
+                    "tool to wipe all auth artifacts (session file, "
+                    "auth_state, expired-streak counter) and start fresh. "
+                    "After that, call `make_call` with the user's `phone` "
+                    "to begin a clean authentication."
+                )
+            fail(
+                base + "Call `make_call` with the user's `phone` to restart "
+                "the auth flow with a fresh code. If this happens again on "
+                "the next attempt, call `reset_telegram_auth` to fully wipe "
+                "the local Telegram session before retrying."
             )
         except errors.FloodWait as e:
             wait = _flood_wait_seconds(e)
@@ -465,22 +573,40 @@ async def verify_phone_code(code: str) -> None:
                 "with the correct `code`. Do NOT restart the auth flow."
             )
         except errors.PhoneCodeExpired:
-            # KEEP state. Telegram says the code is expired, but the
-            # phone_code_hash is still potentially usable for `resend_code`,
-            # which will issue a fresh code via the next channel without
-            # tearing down the whole auth attempt.
+            # KEEP auth_state (the phone_code_hash may still work for resend),
+            # but bump the consecutive-expiration streak so we can detect the
+            # session-corruption loop where every fresh code is rejected.
+            streak = _read_expired_streak() + 1
+            _write_expired_streak(streak)
+            _debug_log(
+                f"sign_in PHONE_CODE_EXPIRED streak={streak} elapsed={elapsed} "
+                f"hash_prefix={hash_prefix!r}"
+            )
             msg = (
                 f"Telegram says the verification code has expired "
                 f"(PHONE_CODE_EXPIRED). It was issued {elapsed_str} ago via "
                 f"{sent_label} (hash prefix {hash_prefix!r}). "
             )
+            if streak >= 2:
+                msg += (
+                    f"This is the {streak}{'nd' if streak == 2 else 'rd' if streak == 3 else 'th'} "
+                    "consecutive time a fresh code has been rejected as "
+                    "expired — the locally-stored Telegram session "
+                    "(`telegram-call.session`) is almost certainly "
+                    "desynchronised (e.g. a stale auth_key from a previous "
+                    "DC). RECOVERY: call the `reset_telegram_auth` tool to "
+                    "wipe all auth artifacts and start fresh, then "
+                    "`make_call` with the user's `phone` to restart auth."
+                )
+                fail(msg)
             if elapsed is not None and elapsed < 60:
                 msg += (
                     "Since this was less than a minute ago, the most likely "
-                    "explanation is that an EARLIER code from a previous "
-                    "attempt was being submitted by mistake — ask the user "
-                    "to double-check they're reading the *most recent* "
-                    "5-digit code in their Telegram app, not an older one. "
+                    "explanations are: (a) the user submitted an EARLIER "
+                    "code from a previous attempt (ask them to read the "
+                    "*most recent* 5-digit code in their Telegram app), or "
+                    "(b) the local Telegram session is corrupted and "
+                    "Telegram is invalidating codes on issuance. "
                 )
             else:
                 msg += (
@@ -494,8 +620,8 @@ async def verify_phone_code(code: str) -> None:
             if next_label:
                 msg += f" (next channel: {next_label})"
             msg += (
-                ". Only fall back to `make_call` with `phone` if resend "
-                "also fails."
+                ". If resend also fails, call `reset_telegram_auth` to wipe "
+                "the local session and restart cleanly."
             )
             fail(msg)
         except errors.FloodWait as e:
@@ -941,6 +1067,28 @@ async def amain_verify(input_data: dict) -> None:
     )
 
 
+def amain_reset(input_data: dict) -> None:
+    """Handler for the `reset_telegram_auth` tool. Wipes every auth artifact
+    (auth_state.json, auth_complete marker, .session file & journal,
+    expired-streak counter) so the next `make_call` performs a fresh DH key
+    exchange. Synchronous — no Telegram round-trip needed."""
+    summary = purge_session_files()
+    _debug_log(f"reset_telegram_auth removed={summary['removed']}")
+    removed = summary["removed"]
+    if not removed:
+        ok(
+            "Nothing to reset: no Telegram auth artifacts were present. "
+            "You can proceed by calling `make_call` with the user's `phone` "
+            "to start a fresh authentication."
+        )
+        return
+    ok(
+        f"Telegram auth state reset. Removed: {', '.join(removed)}. The "
+        "next call to `make_call` with the user's `phone` will perform a "
+        "fresh DH key exchange and issue a brand-new verification code."
+    )
+
+
 def main() -> None:
     tool_name = sys.argv[1] if len(sys.argv) > 1 else "unknown"
 
@@ -981,6 +1129,15 @@ def main() -> None:
             raise
         except Exception as e:
             fail(f"Verification failed: {type(e).__name__}: {e}")
+        return
+
+    if tool_name == "reset_telegram_auth":
+        try:
+            amain_reset(input_data)
+        except SystemExit:
+            raise
+        except Exception as e:
+            fail(f"Reset failed: {type(e).__name__}: {e}")
         return
 
     fail(f"Unknown tool: {tool_name}")

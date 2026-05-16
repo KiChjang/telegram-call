@@ -1,7 +1,7 @@
 ---
 name: telegram-call
 description: Synthesize a spoken message and place an outgoing 1-on-1 Telegram voice call that plays it. Self-installs and self-authenticates on first use. Triggers: call me, phone call, voice call, urgent notification, call X about Y, tell X.
-version: 0.4.2
+version: 0.4.3
 author: Keith Yeung
 always: false
 requires_bins: python3,ffmpeg
@@ -20,13 +20,14 @@ Use this for urgent notifications that need immediate attention, e.g. "call
 
 ## Tools
 
-The skill ships three tools so the LLM can keep concerns clean:
+The skill ships four tools so the LLM can keep concerns clean:
 
 | Tool                     | Purpose                                          |
 | ------------------------ | ------------------------------------------------ |
 | `synthesize_speech`      | Turn text into an mp3 (Kokoro-FastAPI)           |
 | `verify_telegram_code`   | Submit a Telegram verification code or 2FA pwd   |
 | `make_call`              | Initiate auth (with `phone`) or place the call   |
+| `reset_telegram_auth`    | Wipe local Telegram auth (recovery only)         |
 
 ### synthesize_speech
 
@@ -90,6 +91,33 @@ If you instead see a flood-wait message (Telegram is rate-limiting code
 requests for that number), wait the indicated duration before retrying —
 sending another code immediately won't deliver and will only push the
 flood-wait window further out.
+
+#### Telegram keeps rejecting fresh codes as expired?
+
+If Telegram returns `PHONE_CODE_EXPIRED` on a code that was issued seconds
+ago, the local pyrogram session (`telegram-call.session`) has almost
+certainly desynchronised from Telegram's view — typically a stale
+`auth_key` left over from a previous DC migration. The skill detects this
+once it has happened twice in a row and tells the agent to call
+`reset_telegram_auth`, which wipes the session file and lets the next
+`make_call` perform a clean DH key exchange.
+
+### reset_telegram_auth
+
+Recovery-only tool. Deletes every locally-stored Telegram auth artifact
+for this skill:
+
+- `auth_state.json` (in-flight `phone_code_hash`, sent-channel hints, …)
+- `auth_complete` (the post-login marker)
+- `telegram-call.session` and `telegram-call.session-journal`
+  (pyrogram's SQLite session storing `auth_key`, DC id, etc.)
+- `expired_streak.json` (the consecutive-`PHONE_CODE_EXPIRED` counter)
+
+After running this, the next `make_call` with `phone` performs a fresh DH
+key exchange against Telegram, which is what unsticks the
+"every fresh code immediately expires" loop. Don't call this preemptively
+— the skill's own messages will tell you when it's the appropriate next
+step.
 
 ### make_call
 
@@ -211,14 +239,32 @@ There is no setup script and no `pip install` to run.
 
 ## Resetting auth
 
-If something gets stuck and you want to start the login over from scratch,
-delete the auth artifacts under `$OCTOS_DATA_DIR/telegram-call/`:
+The cleanest way is to ask the agent to call the `reset_telegram_auth`
+tool — it does everything atomically. If you want to do it from a shell
+instead:
 
 ```sh
 rm -f "$OCTOS_DATA_DIR/telegram-call/auth_state.json" \
       "$OCTOS_DATA_DIR/telegram-call/auth_complete" \
-      "$OCTOS_DATA_DIR/telegram-call/telegram-call.session"
+      "$OCTOS_DATA_DIR/telegram-call/telegram-call.session" \
+      "$OCTOS_DATA_DIR/telegram-call/telegram-call.session-journal" \
+      "$OCTOS_DATA_DIR/telegram-call/expired_streak.json"
 ```
 
 Next call to `make_call` will start the phone → code → optional 2FA flow
-again from the beginning.
+again from the beginning, with a fresh DH key exchange.
+
+## Debug logging
+
+If auth keeps failing in a hard-to-explain way, set `TELEGRAM_CALL_DEBUG=1`
+in the skill's environment. Each invocation will then append timestamped
+diagnostics — DC id, `auth_key` hex prefix, `phone_code_hash` prefix,
+which RPC failures fired — to:
+
+```text
+$OCTOS_DATA_DIR/telegram-call/debug.log
+```
+
+The log contains no secrets; it deliberately truncates `auth_key` to its
+first 8 hex chars so you can verify whether it's stable across processes
+without leaking key material.
