@@ -682,10 +682,40 @@ def synthesize_speech_tool(input_data: dict) -> None:
     )
 
 
+def _phone_digits(s: str) -> str:
+    """Return only the digits of a phone-number-ish string, so '+44 7700 900000',
+    '+447700900000', and '00447700900000' all compare equal."""
+    digits = "".join(c for c in (s or "") if c.isdigit())
+    return digits.lstrip("0")
+
+
 async def amain_make_call(input_data: dict) -> None:
     phone = (input_data.get("phone") or "").strip()
+    target = (input_data.get("target") or "").strip()
+    audio_path = input_data.get("audio_path", "")
+    message = input_data.get("message", "")
     state = load_auth_state()
     awaiting = state.get("awaiting")
+
+    # Guard against the LLM copying `target` into `phone`. The two parameters
+    # represent different people: `phone` is the caller's own Telegram account
+    # (only used during one-time login) and `target` is the recipient.
+    # Sending a Telegram login code to the recipient's number would be both
+    # privacy-violating and useless.
+    phone_digits = _phone_digits(phone)
+    target_digits = _phone_digits(target)
+    if phone_digits and target_digits and phone_digits == target_digits:
+        fail(
+            f"Refusing to authenticate: the supplied `phone` ({phone}) is "
+            f"the same number as `target` ({target}). These MUST be "
+            "different people. `phone` is the user's OWN Telegram account "
+            "(the one PLACING the call); `target` is the RECIPIENT being "
+            "called. Do not copy `target` into `phone`. Ask the user "
+            "explicitly: 'What is the phone number of YOUR own Telegram "
+            "account (the one that will be placing this call)?' — and call "
+            "`make_call` again with that number as `phone`, leaving "
+            "`target` unchanged."
+        )
 
     if not auth_complete():
         if awaiting == "code":
@@ -695,11 +725,12 @@ async def amain_make_call(input_data: dict) -> None:
             next_label = _SENT_CODE_LABELS.get(state.get("next_type") or "", None)
             msg = (
                 f"Telegram is awaiting the verification code that was sent "
-                f"to {state['phone']} via {sent_label}. Ask the user for the "
-                "code and call the `verify_telegram_code` tool with it as "
-                "`code`. Do NOT call `make_call` again until verification "
-                "succeeds — calling it with `phone` would invalidate the "
-                "code."
+                f"to {state['phone']} (the user's OWN Telegram account, "
+                f"which is being authenticated) via {sent_label}. Ask the "
+                "user for the code and call the `verify_telegram_code` "
+                "tool with it as `code`. Do NOT call `make_call` again "
+                "until verification succeeds — calling it with `phone` "
+                "would invalidate the code."
             )
             if next_label:
                 msg += (
@@ -719,23 +750,26 @@ async def amain_make_call(input_data: dict) -> None:
             await send_phone_code(phone)
             # send_phone_code always exits via fail() with instructions.
             return
+        target_hint = (
+            f" (For clarity: `target` is currently {target!r}, which is the "
+            "RECIPIENT — do NOT use that number as `phone`.)"
+            if target else ""
+        )
         fail(
-            "Telegram is not authenticated yet. Ask the user for the phone "
-            "number of the Telegram account that should PLACE the call "
-            "(this is the user's OWN Telegram account, NOT the recipient's "
-            "number — the recipient is given via `target` later). It must "
-            "include the international country code, e.g. '+447700900000'. "
-            "Then call `make_call` again with `phone` set to that value. "
-            "Telegram will deliver a 5-digit verification code to the user's "
-            "existing Telegram sessions (in-app message from the 'Telegram' "
+            "Telegram is not authenticated yet. The skill needs to log in "
+            "to the user's OWN Telegram account before it can place any "
+            "calls. Ask the user a direct question — verbatim or close to "
+            "it — like: 'What's the phone number of YOUR personal Telegram "
+            "account? (Not the person you want to call — your own.)' "
+            "It must include the international country code, e.g. "
+            "'+447700900000'. Then call `make_call` again with `phone` set "
+            "to that value." + target_hint + " Telegram will deliver a "
+            "5-digit verification code to the user's existing Telegram "
+            "sessions (an in-app message from the official 'Telegram' "
             "service account) before falling back to SMS. After Telegram "
             "issues the code, the agent must call `verify_telegram_code` "
             "with the `code` parameter — NOT `make_call` again."
         )
-
-    target = (input_data.get("target") or "").strip()
-    audio_path = input_data.get("audio_path", "")
-    message = input_data.get("message", "")
 
     if not target:
         fail(

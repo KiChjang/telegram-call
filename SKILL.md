@@ -96,7 +96,7 @@ flood-wait window further out.
 Initiates the auth flow (when `phone` is supplied) or places the actual
 Telegram call (when authenticated). Same tool, two phases.
 
-> **Two phone numbers, two parameters.** The skill deals with two distinct
+> **Two phone numbers, two people.** The skill deals with two distinct
 > Telegram identities:
 >
 > - `phone` — your **own** Telegram account, the one **placing** the call.
@@ -104,6 +104,9 @@ Telegram call (when authenticated). Same tool, two phases.
 > - `target` — the **recipient**, the one being called.
 >
 > They are not interchangeable. `phone` is your number; `target` is theirs.
+> The skill refuses to send a verification code if `phone` and `target`
+> resolve to the same digits, on the assumption the agent has confused
+> the two; you'll get a `success: false` envelope explaining the mistake.
 
 **Parameters:**
 
