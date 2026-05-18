@@ -1,7 +1,20 @@
 ---
 name: telegram-call
-description: Synthesize a spoken message and place an outgoing 1-on-1 Telegram voice call that plays it. Self-installs and self-authenticates on first use. Triggers: call me, phone call, voice call, urgent notification, call X about Y, tell X.
-version: 0.4.9
+description: |
+  Place an outgoing 1-on-1 Telegram VOICE CALL to a specific recipient and
+  play a synthesized spoken message during the call. ONLY use this skill
+  when the user has explicitly asked for a phone call, voice call, or
+  Telegram call — phrases like "call Alice", "ring her up", "give him a
+  call on Telegram", "voice-call X". Trigger keywords (in any language)
+  must be the verb meaning "to telephone / to make a phone call", not
+  the verb "to tell / to greet / to message". Do NOT use this skill for:
+  sending a text message, posting in a chat, greeting someone, conveying
+  a written note, leaving a chat message, "tell X that …", "let X know
+  …", "say hi to X", "挨拶する", "メッセージを送る", "伝える" — those are
+  text-messaging or general-conversation requests and this skill is not
+  the right tool for them. If the user's intent is ambiguous between
+  text and voice, ASK before invoking this skill; do not assume voice.
+version: 0.4.10
 author: Keith Yeung
 always: false
 requires_bins: python3,ffmpeg
